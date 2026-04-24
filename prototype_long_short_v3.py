@@ -146,6 +146,10 @@ _last_scout_score = 0.0      # 上次多頭 scout 的 Score
 _last_scout_adx_short = 0.0  # 上次空頭 scout 的 ADX
 _last_scout_score_short = 0.0  # 上次空頭 scout 的 Score
 
+# ADX MEI（動能耗盡指數）追蹤：保留最近 3 次 regime 計算的 (timestamp, mean_adx)
+# MEI = 二階導數（加速度）/ |初速度|，用於探測 ADX 是否正在急速鈍化（趨近頂部）
+_adx_history: list = []  # [(unix_ts, mean_adx), ...]，最多保留 3 筆
+
 # 市場狀態記憶（用於Telegram通知）
 _last_market_signal = 0  # 上次市場信號
 _last_market_notification_time = 0  # 上次通知時間
@@ -1232,6 +1236,41 @@ def get_btc_regime_v3_fast():
             except Exception as e:
                 logger.warning(f"⚠️ Telegram市場狀態通知失敗: {e}")
 
+        # ── ADX MEI（動能耗盡指數）計算 ──
+        # MEI = (v₂ - v₁) / |v₁|
+        # v₁、v₂ 為相鄰兩段的 ADX 速度（每 5min bar 標準化）
+        # MEI < -0.5 → 動能急速鈍化（趨近頂部）；MEI < -0.8 → 頂部確認
+        global _adx_history
+        _adx_history.append((time.time(), mean_adx))
+        _adx_history = _adx_history[-3:]  # 只保留最近 3 筆
+
+        adx_mei = 0.0
+        adx_velocity_n = 0.0
+        if len(_adx_history) >= 3:
+            t0, a0 = _adx_history[-3]
+            t1, a1 = _adx_history[-2]
+            t2, a2 = _adx_history[-1]
+            dt1 = max((t1 - t0) / 300, 0.01)   # 每 5min bar
+            dt2 = max((t2 - t1) / 300, 0.01)
+            v1 = (a1 - a0) / dt1
+            v2 = (a2 - a1) / dt2
+            adx_velocity_n = v2
+            adx_accel = v2 - v1
+            adx_mei = adx_accel / abs(v1) if abs(v1) > 0.01 else 0.0
+        elif len(_adx_history) >= 2:
+            t0, a0 = _adx_history[-2]
+            t1, a1 = _adx_history[-1]
+            dt = max((t1 - t0) / 300, 0.01)
+            adx_velocity_n = (a1 - a0) / dt
+
+        # MEI 診斷輸出（僅有意義時顯示）
+        if len(_adx_history) >= 3:
+            mei_status = ("🔴頂部確認" if adx_mei < -0.8 else
+                          "🟠動能鈍化" if adx_mei < -0.5 else
+                          "🟡輕微減速" if adx_mei < -0.3 else
+                          "🟢加速/勻速")
+            print(f"  📐 ADX MEI={adx_mei:+.2f} | Vel={adx_velocity_n:+.3f}/bar | {mei_status}")
+
         result = {
             'signal': signal,
             'brake': brake,
@@ -1242,7 +1281,9 @@ def get_btc_regime_v3_fast():
             'mean_z': mean_z,
             'mean_adx': mean_adx,
             'is_highvol': is_highvol,
-            'is_bear': is_bear
+            'is_bear': is_bear,
+            'adx_mei': adx_mei,
+            'adx_velocity': adx_velocity_n,
         }
         _regime_cache['data'] = result
         _regime_cache['ts'] = time.time()
@@ -2356,39 +2397,46 @@ def main():
                 if is_long_signal:
                     mean_adx = regime.get('mean_adx', 0)
                     curr_score = regime.get('market_score', 0)
+                    adx_mei = regime.get('adx_mei', 0.0)
 
-                    # ADX衰減檢測
-                    adx_decay = _last_scout_adx - mean_adx if _last_scout_adx > 0 else 0
-
-                    # Score衰減檢測
+                    # Score 衰減仍作為獨立閘門（複合分數轉差 = 整體市場結構惡化）
                     score_decay = _last_scout_score - curr_score if _last_scout_score > 0 else 0
 
-                    # 分級調整邏輯
+                    # ── 多頭 MEI 過濾（二階導數：動能耗盡 → 趨近頂部） ──
                     if mean_adx < 20:
                         print(f"⚠️ ADX={mean_adx:.1f} < 20，弱趨勢不交易")
                     elif score_decay > 0.05 and _last_scout_score > 0:
-                        # Score衰減超過0.05：跳過本輪入場
                         print(f"⚠️ Score衰減 {score_decay:.3f}（{_last_scout_score:.3f}→{curr_score:.3f}），跳過本輪入場")
                         _last_scout_adx = mean_adx
                         _last_scout_score = curr_score
-                        continue  # 跳過後續掃描
-                    elif adx_decay > 2.0:
-                        # ADX衰減超過2點：強制減倉至50%
-                        position_multiplier = 0.5
-                        print(f"⚠️ ADX衰減 {adx_decay:.1f}點（{_last_scout_adx:.1f}→{mean_adx:.1f}），倉位降至50%")
-                    elif mean_adx < 25:
-                        # 中等趨勢：降低倉位至70%
+                        continue
+                    elif adx_mei < -0.8:
+                        # 頂部確認：ADX 急速鈍化，動能耗盡，完全跳過多頭
+                        print(f"🔴 MEI={adx_mei:.2f} → 頂部確認，跳過多頭入場（ADX={mean_adx:.1f}）")
+                        _last_scout_adx = mean_adx
+                        _last_scout_score = curr_score
+                        continue
+                    elif adx_mei < -0.5:
+                        # 動能急速鈍化：重度減倉
+                        position_multiplier = 0.3
+                        print(f"🟠 MEI={adx_mei:.2f} → 動能急速鈍化，多頭倉位降至30%（ADX={mean_adx:.1f}）"
+                              f"{'[SIM]' if SIMULATION_MODE else ''}")
+                    elif adx_mei < -0.3:
+                        # 輕微鈍化：輕度減倉
                         position_multiplier = 0.7
-                        print(f"🟡 趨勢多頭+2（ADX={mean_adx:.1f}）中等趨勢，倉位調整至{position_multiplier * 100:.0f}%"
+                        print(f"🟡 MEI={adx_mei:.2f} → 輕微鈍化，多頭倉位降至70%（ADX={mean_adx:.1f}）"
+                              f"{'[SIM]' if SIMULATION_MODE else ''}")
+                    elif mean_adx < 25:
+                        position_multiplier = 0.7
+                        print(f"🟡 趨勢多頭+2（ADX={mean_adx:.1f}）中等趨勢，倉位70%"
                               f"{'[SIM]' if SIMULATION_MODE else ''}掃描...")
                     else:
-                        # 強趨勢：正常倉位
                         position_multiplier = 1.0
-                        print(f"🟢 趨勢多頭+2（ADX={mean_adx:.1f}）強趨勢，正常倉位"
+                        print(f"🟢 趨勢多頭+2（ADX={mean_adx:.1f} MEI={adx_mei:+.2f}）強趨勢，正常倉位"
                               f"{'[SIM]' if SIMULATION_MODE else ''}掃描...")
 
-                    _last_scout_adx = mean_adx  # 更新ADX記憶
-                    _last_scout_score = curr_score  # 更新Score記憶
+                    _last_scout_adx = mean_adx
+                    _last_scout_score = curr_score
 
                     # 只有在非弱趨勢情況下才進行後續檢查
                     if mean_adx >= 20:
@@ -2419,12 +2467,14 @@ def main():
                 elif can_short_entry:
                     mean_adx = regime.get('mean_adx', 0)
                     curr_score = regime.get('market_score', 0)
+                    adx_mei = regime.get('adx_mei', 0.0)
 
                     # [BUG FIX] 空單使用獨立 decay 追蹤，避免與多頭狀態互相污染
                     global _last_scout_adx_short, _last_scout_score_short
-                    adx_decay = _last_scout_adx_short - mean_adx if _last_scout_adx_short > 0 else 0
                     score_decay = _last_scout_score_short - curr_score if _last_scout_score_short > 0 else 0
 
+                    # ── 空頭 MEI 過濾（方向邏輯：ADX退坡 = 趨勢轉空的良機，不應過濾） ──
+                    # 空頭不因 MEI 負而跳過；只在極端衰退時減倉（動能耗盡連空都難推）
                     if mean_adx < 20:
                         print(f"⚠️ ADX={mean_adx:.1f} < 20，弱趨勢不交易(空)")
                     elif score_decay > 0.05 and _last_scout_score_short > 0:
@@ -2432,16 +2482,23 @@ def main():
                         _last_scout_adx_short = mean_adx
                         _last_scout_score_short = curr_score
                         continue
-                    elif adx_decay > 2.0:
+                    elif adx_mei < -1.5:
+                        # 極端衰退：即使空頭也要謹慎（市場可能進入橫盤壓縮）
                         position_multiplier = 0.5
-                        print(f"⚠️ ADX衰減 {adx_decay:.1f}點（{_last_scout_adx_short:.1f}→{mean_adx:.1f}），空單倉位降至50%")
+                        print(f"🟡 MEI={adx_mei:.2f} → 極端衰退，空頭謹慎減倉50%（ADX={mean_adx:.1f}）"
+                              f"{'[SIM]' if SIMULATION_MODE else ''}")
+                    elif adx_mei < -0.8:
+                        # 動能退坡：空頭趨勢轉折良機，適度減倉
+                        position_multiplier = 0.7
+                        print(f"🟡 MEI={adx_mei:.2f} → 趨勢頂後翻空，空頭倉位70%（ADX={mean_adx:.1f}）"
+                              f"{'[SIM]' if SIMULATION_MODE else ''}")
                     elif mean_adx < 25:
                         position_multiplier = 0.7
-                        print(f"🟡 空頭regime {regime_signal}（ADX={mean_adx:.1f}）中等趨勢，空單倉位{position_multiplier * 100:.0f}%"
+                        print(f"🟡 空頭regime {regime_signal}（ADX={mean_adx:.1f}）中等趨勢，空單倉位70%"
                               f"{'[SIM]' if SIMULATION_MODE else ''}掃描...")
                     else:
                         position_multiplier = 1.0
-                        print(f"🟢 空頭regime {regime_signal}（ADX={mean_adx:.1f}）強趨勢，空單正常倉位"
+                        print(f"🟢 空頭regime {regime_signal}（ADX={mean_adx:.1f} MEI={adx_mei:+.2f}）強趨勢，空單正常倉位"
                               f"{'[SIM]' if SIMULATION_MODE else ''}掃描...")
 
                     _last_scout_adx_short = mean_adx
