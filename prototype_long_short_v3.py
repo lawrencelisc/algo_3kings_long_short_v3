@@ -140,9 +140,11 @@ cooldown_tracker = {}
 consecutive_losses = {}
 recent_sl_times = []  # Cascade Pause 追蹤器
 
-# ADX 和 Score 趨勢追蹤
-_last_scout_adx = 0.0  # 上次 scout 的 ADX
-_last_scout_score = 0.0  # 上次 scout 的 Score
+# ADX 和 Score 趨勢追蹤（多/空分開記憶，避免制度切換時 decay 計算污染）
+_last_scout_adx = 0.0        # 上次多頭 scout 的 ADX
+_last_scout_score = 0.0      # 上次多頭 scout 的 Score
+_last_scout_adx_short = 0.0  # 上次空頭 scout 的 ADX
+_last_scout_score_short = 0.0  # 上次空頭 scout 的 Score
 
 # 市場狀態記憶（用於Telegram通知）
 _last_market_signal = 0  # 上次市場信號
@@ -151,11 +153,11 @@ _last_market_notification_time = 0  # 上次通知時間
 # ==========================================
 # ⚙️ [系統/參數] 策略與風控全局變數
 # ==========================================
-WORKING_CAPITAL = 1000.0
-MAX_LEVERAGE = 10.0
+WORKING_CAPITAL = 150.0
+MAX_LEVERAGE = 3.0
 RISK_PER_TRADE = 0.005
 MIN_NOTIONAL = 5.0
-MAX_NOTIONAL_PER_TRADE = 200.0
+MAX_NOTIONAL_PER_TRADE = 20.0
 
 NET_FLOW_SIGMA = 1.2
 TP_ATR_MULT = 5.0
@@ -286,6 +288,28 @@ def sim_open_short(symbol, amount, price):
     return amount, price
 
 
+def _sim_calc_equity(exclude_symbol=None):
+    """
+    計算 Sim 帳戶總資產（含未實現 PnL）。
+    多單：unrealized = (現價 - 入場價) * 數量
+    空單：unrealized = (入場價 - 現價) * 數量
+    [BUG FIX] 舊版對多/空都用 amount * 現價（多單公式），空單結果錯誤。
+    """
+    unrealized = 0.0
+    for s, p in sim_positions.items():
+        if s == exclude_symbol:
+            continue
+        try:
+            curr = exchange.fetch_ticker(s)['last']
+            if p.get('side', 'long') == 'short':
+                unrealized += (p['entry_price'] - curr) * p['amount']
+            else:
+                unrealized += (curr - p['entry_price']) * p['amount']
+        except Exception:
+            pass
+    return sim_balance + unrealized
+
+
 def sim_close_long(symbol, amount, price):
     """
     模擬平多單
@@ -306,10 +330,7 @@ def sim_close_long(symbol, amount, price):
     sim_balance += proceeds
     sim_total_pnl += net_pnl
     sim_trade_count += 1
-    sim_equity = sim_balance + sum(
-        sim_positions[s]['amount'] * exchange.fetch_ticker(s)['last']
-        for s in sim_positions if s != symbol
-    ) if len(sim_positions) > 1 else sim_balance
+    sim_equity = _sim_calc_equity(exclude_symbol=symbol)
     logger.info(
         f"🔵 [SIM] CLOSE LONG {symbol} | 出場:{price:.4f} 入場:{entry_price:.4f} "
         f"| PnL:{net_pnl:+.4f} | 總PnL:{sim_total_pnl:+.4f} | 餘額:{sim_balance:.2f}"
@@ -332,10 +353,7 @@ def sim_close_short(symbol, amount, price):
     sim_balance += proceeds
     sim_total_pnl += net_pnl
     sim_trade_count += 1
-    sim_equity = sim_balance + sum(
-        sim_positions[s]['amount'] * exchange.fetch_ticker(s)['last']
-        for s in sim_positions if s != symbol
-    ) if len(sim_positions) > 1 else sim_balance
+    sim_equity = _sim_calc_equity(exclude_symbol=symbol)
     logger.info(
         f"🔵 [SIM] CLOSE SHORT {symbol} | 出場:{price:.4f} 入場:{entry_price:.4f} "
         f"| PnL:{net_pnl:+.4f} | 總PnL:{sim_total_pnl:+.4f} | 餘額:{sim_balance:.2f}"
@@ -609,14 +627,22 @@ def load_dynamic_blacklist():
             pass
 
 
-def handle_trade_result(symbol, pnl):
+def handle_trade_result(symbol, pnl, is_sl_exit=False):
+    """
+    處理交易結果，更新連敗計數與冷卻期。
+    is_sl_exit=True  → 由真正的 SL/Trail SL 觸發（計入 Cascade SL 計數）
+    is_sl_exit=False → Timeout / Flow Reversal 等原因（不計入 Cascade，避免誤觸發）
+    [BUG FIX] 舊版所有負 PnL 出場都計入 recent_sl_times，
+              Timeout 出場會誤觸 Cascade 保護，暫停正常入場。
+    """
     global consecutive_losses, cooldown_tracker, recent_sl_times
     if pnl > 0:
         consecutive_losses[symbol] = 0
         if symbol in cooldown_tracker: del cooldown_tracker[symbol]
     elif pnl < 0:
         consecutive_losses[symbol] = consecutive_losses.get(symbol, 0) + 1
-        recent_sl_times.append(time.time())  # 記錄SL時間
+        if is_sl_exit:
+            recent_sl_times.append(time.time())  # 只有真正 SL 才計入 Cascade 計數
         if consecutive_losses[symbol] >= MAX_CONSECUTIVE_LOSSES:
             cooldown_tracker[symbol] = time.time() + DYNAMIC_BAN_DURATION
         else:
@@ -684,8 +710,8 @@ def get_btc_regime_v3_fast():
         EMA_WIN = 21
 
         # ── [BUG FIX 1] 固定閾值，與 score ∈ [0,1] 同量綱 ──
-        MR_SCORE_THR = 0.55  # score > 0.55 → MR 市況
-        TR_SCORE_THR = 0.40  # score ≤ 0.40 → 趨勢市況
+        MR_SCORE_THR = 0.55  # score >= 0.55 → MR 市況
+        TR_SCORE_THR = 0.40  # score <= 0.40 → 趨勢市況
 
         # ── Z-Score 百分位（保留動態，量綱本身就是 z-score）──
         Z_LONG_PCT = 20
@@ -984,8 +1010,11 @@ def get_btc_regime_v3_fast():
         all_bbw_np = np.array(last_bbw)
         all_z_abs_np = np.abs(np.array(last_z))
 
-        adx_lo = safe_pct(all_scores_np, 10);
-        adx_hi = safe_pct(all_scores_np, 90)
+        # [BUG FIX] adx_lo/adx_hi 必須用實際 ADX 值（15~50），
+        # 舊版誤用 all_scores_np（0~1 複合分數），導致 adx_n 永遠 clip 到 1.0，
+        # ADX 對 score 完全無貢獻。
+        adx_lo = safe_pct(all_adx_np, 10);
+        adx_hi = safe_pct(all_adx_np, 90)
         bbw_lo = safe_pct(all_bbw, 10);
         bbw_hi = safe_pct(all_bbw, 90)
         z_lo = safe_pct(np.abs(np.array(all_z_scores)), 10)
@@ -1013,9 +1042,9 @@ def get_btc_regime_v3_fast():
             if len(data['ret']) > 0 and data['ret'][-1] > MACRO_BULL_RTN_THR
         )
         n_assets = len(regime_data)
-        # 超過半數資產 1 天收益率 < -4% → 熊市閘門開啟
+        # 超過半數資產 1 天收益率 < -3% (MACRO_BEAR_RTN_THR=-0.03) → 熊市閘門開啟
         is_bear = (bear_votes > n_assets // 2)
-        # 超過半數資產 1 天收益率 > +3% → 強制解除熊市
+        # 超過半數資產 1 天收益率 > +2% (MACRO_BULL_RTN_THR=+0.02) → 強制解除熊市
         if bull_votes > n_assets // 2:
             is_bear = False
 
@@ -1041,24 +1070,56 @@ def get_btc_regime_v3_fast():
         )
 
         # ────────────────────────────────────────────────
-        # 信號生成
+        # 信號生成（含逐層診斷）
         # ────────────────────────────────────────────────
         regime_signal = 0
+        _block_reason = []  # 逐層封鎖原因收集
 
         if is_highvol:
             regime_signal = 0
-        elif score >= mr_thr:  # [BUG FIX 1] score ∈[0,1] vs 0.55
+            _block_reason.append(f"L1-HighVol: ATR%={mean_atr:.4f} > {atr_hi:.4f}")
+        elif score >= mr_thr:
             if mean_z <= zl_thr:
                 regime_signal = 0 if is_bear else +1
+                if is_bear:
+                    _block_reason.append(f"L3-Bear擋+1: bear={is_bear}")
             elif mean_z >= zs_thr:
                 regime_signal = -1
+            else:
+                _block_reason.append(
+                    f"L2-MR但Z不極端: z={mean_z:+.3f} 需<={zl_thr:.3f}或>={zs_thr:.3f}")
         elif score <= tr_thr and mean_adx >= 20 and mean_bbw >= bb_thr:
             if mean_ndipdi < -5 and ema_dir == +1:
                 regime_signal = 0 if is_bear else +2
+                if is_bear:
+                    _block_reason.append(f"L3-Bear擋+2: bear={is_bear}")
             elif mean_ndipdi > +5 and ema_dir == -1:
                 regime_signal = -2
-        elif is_bear and score >= mr_thr and mean_z >= bear_z_thr:
+            else:
+                # 逐項診斷 Trend 分支內部失敗原因
+                if not (mean_ndipdi < -5):
+                    _block_reason.append(f"L3C-NDI-PDI不足: {mean_ndipdi:+.2f} 需<-5(多)或>+5(空)")
+                if ema_dir == 0:
+                    _block_reason.append(f"L3D-EMA無共識: ema_dir=0 (需5/8資產連3根同向)")
+                elif ema_dir == +1 and mean_ndipdi > +5:
+                    _block_reason.append(f"L3D-EMA方向衝突: ndipdi={mean_ndipdi:+.2f}>+5但ema=↑")
+                elif ema_dir == -1 and mean_ndipdi < -5:
+                    _block_reason.append(f"L3D-EMA方向衝突: ndipdi={mean_ndipdi:+.2f}<-5但ema=↓")
+        elif score > tr_thr and score < mr_thr:
+            _block_reason.append(
+                f"L2-死區: score={score:.3f} 在 ({tr_thr:.2f},{mr_thr:.2f}) 死區內")
+        elif score <= tr_thr:
+            if mean_adx < 20:
+                _block_reason.append(f"L3A-ADX不足: {mean_adx:.1f} < 20")
+            if mean_bbw < bb_thr:
+                _block_reason.append(f"L3B-BBW不足: {mean_bbw:.4f} < {bb_thr:.4f}")
+
+        if is_bear and score >= mr_thr and mean_z >= bear_z_thr:
             regime_signal = -3
+
+        # 顯示封鎖原因（無信號時）
+        if regime_signal == 0 and _block_reason:
+            print(f"  🚧 信號封鎖原因: {' | '.join(_block_reason)}")
 
         # ── 轉換為 signal / brake 格式（向下兼容）──
         if regime_signal > 0:
@@ -1092,11 +1153,6 @@ def get_btc_regime_v3_fast():
             'decision_text': status_text
         })
 
-        print("-" * 60)
-        current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"🌐 市場狀態 V6.7 BugFixed（{len(regime_data)} 個資產）[{current_time}]"
-              + (" [SIM]" if SIMULATION_MODE else " [LIVE]"))
-
         # 顯示三個資產的現價
         btc_p = regime_data.get('BTC/USDT:USDT', {}).get('closes', [0])[-1]
         eth_p = regime_data.get('ETH/USDT:USDT', {}).get('closes', [0])[-1]
@@ -1122,13 +1178,22 @@ def get_btc_regime_v3_fast():
             f"{signal_names.get(regime_signal, 'No Signal')}",
             status_text
         ]
-        max_len = max(len(l) for l in labels)
         pad = max(len(max(labels, key=len)) + 4, 18)
-        sep_len = pad + 45
+        table_lines = [f"  {lbl:<{pad}}{val}" for lbl, val in zip(labels, values)]
+        utc_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        hdr_line = (
+            f"🌐 市場狀態 V6.7 BugFixed（{len(regime_data)} 個資產）[{utc_str}]"
+            + (" [SIM]" if SIMULATION_MODE else " [LIVE]")
+        )
+        # 分隔線與最寬一行對齊（emoji 顯示寬度略大於 len，留少量餘量）
+        sep_len = max(len(hdr_line), max(len(L) for L in table_lines)) + 2
+        sep_len = max(sep_len, 60)
 
         print("-" * sep_len)
-        for lbl, val in zip(labels, values):
-            print(f"  {lbl:<{pad}}{val}")
+        print(hdr_line)
+        print("-" * sep_len)
+        for L in table_lines:
+            print(L)
         print("-" * sep_len)
 
         # Telegram市場狀態通知（每小時或信號變化時）
@@ -1195,7 +1260,13 @@ def get_btc_regime_v3_fast():
 # ==========================================
 # 📡 市場掃描
 # ==========================================
-def scouting_strong_coins(scouting_coins=8):
+def scouting_strong_coins(scouting_coins=8, for_short=False):
+    """
+    掃描目標幣種列表。
+    for_short=False（預設）：回傳 24H 漲幅最大的幣（多單用）
+    for_short=True          ：回傳 24H 跌幅最大的幣（空單用）
+    [BUG FIX] 舊版對多/空都回傳漲幅最大，空單方向顛倒。
+    """
     try:
         tickers = exchange.fetch_tickers()
         data = []
@@ -1212,7 +1283,9 @@ def scouting_strong_coins(scouting_coins=8):
                                      'change': t['percentage']})
         df = pd.DataFrame(data)
         if df.empty: return []
-        return df.sort_values('change', ascending=False).head(scouting_coins)['symbol'].tolist()
+        # 空單：選跌幅最大（ascending=True）；多單：選漲幅最大（ascending=False）
+        ascending = for_short
+        return df.sort_values('change', ascending=ascending).head(scouting_coins)['symbol'].tolist()
     except Exception as e:
         print(f"⚠️ Majors Scouting Error: {e}")
         return []
@@ -1553,7 +1626,8 @@ def manage_long_positions(regime=None):
                 real_pnl = process_native_exit_log(
                     s, positions[s], positions[s].get('side', 'long'))
                 cancel_all_v5(s)
-                handle_trade_result(s, real_pnl)
+                # Native exit（Bybit 原生 TP/SL）視為 SL 類型
+                handle_trade_result(s, real_pnl, is_sl_exit=True)
                 del positions[s]
                 if SIMULATION_MODE and s in sim_positions:
                     del sim_positions[s]
@@ -1643,6 +1717,11 @@ def manage_long_positions(regime=None):
                         })
                     except Exception as e:
                         logger.warning(f"⚠️ {s} Trail SL 更新失敗: {e}")
+                        # [BUG FIX] 若交易所回報 "zero position"（原生 TP/SL 已平倉），
+                        # 立即失效 cache，讓下輪迴圈正確偵測 native exit，跳過本輪後續動作
+                        if "10001" in str(e) or "zero position" in str(e).lower():
+                            _positions_cache['ts'] = 0
+                            continue
 
                 # ── 同步 Trail SL 到 sim_positions（Sim only）──
                 if sl_updated and SIMULATION_MODE:
@@ -1774,7 +1853,9 @@ def manage_long_positions(regime=None):
                             logger.warning(f"⚠️ Telegram通知發送失敗: {e}")
 
                     cancel_all_v5(s)
-                    handle_trade_result(s, ioc_pnl)
+                    # [BUG FIX] 只有 SL/Trail SL 觸發才計入 Cascade SL 計數
+                    _is_sl = 'SL' in exit_reason and 'TP' not in exit_reason
+                    handle_trade_result(s, ioc_pnl, is_sl_exit=_is_sl)
                     del positions[s]
 
             except Exception as e:
@@ -2254,7 +2335,7 @@ def main():
 
             if curr_t - last_scout_time > SCOUTING_INTERVAL:
 
-                target_coins = scouting_strong_coins(20)  # 先 scout
+                target_coins = scouting_strong_coins(20, for_short=False)  # 多單：漲幅最大
                 last_scout_time = curr_t
 
                 _current_state = ('HARD' if regime.get('brake') else
@@ -2339,19 +2420,21 @@ def main():
                     mean_adx = regime.get('mean_adx', 0)
                     curr_score = regime.get('market_score', 0)
 
-                    adx_decay = _last_scout_adx - mean_adx if _last_scout_adx > 0 else 0
-                    score_decay = _last_scout_score - curr_score if _last_scout_score > 0 else 0
+                    # [BUG FIX] 空單使用獨立 decay 追蹤，避免與多頭狀態互相污染
+                    global _last_scout_adx_short, _last_scout_score_short
+                    adx_decay = _last_scout_adx_short - mean_adx if _last_scout_adx_short > 0 else 0
+                    score_decay = _last_scout_score_short - curr_score if _last_scout_score_short > 0 else 0
 
                     if mean_adx < 20:
                         print(f"⚠️ ADX={mean_adx:.1f} < 20，弱趨勢不交易(空)")
-                    elif score_decay > 0.05 and _last_scout_score > 0:
-                        print(f"⚠️ Score衰減 {score_decay:.3f}（{_last_scout_score:.3f}→{curr_score:.3f}），跳過本輪空單掃描")
-                        _last_scout_adx = mean_adx
-                        _last_scout_score = curr_score
+                    elif score_decay > 0.05 and _last_scout_score_short > 0:
+                        print(f"⚠️ Score衰減 {score_decay:.3f}（{_last_scout_score_short:.3f}→{curr_score:.3f}），跳過本輪空單掃描")
+                        _last_scout_adx_short = mean_adx
+                        _last_scout_score_short = curr_score
                         continue
                     elif adx_decay > 2.0:
                         position_multiplier = 0.5
-                        print(f"⚠️ ADX衰減 {adx_decay:.1f}點（{_last_scout_adx:.1f}→{mean_adx:.1f}），空單倉位降至50%")
+                        print(f"⚠️ ADX衰減 {adx_decay:.1f}點（{_last_scout_adx_short:.1f}→{mean_adx:.1f}），空單倉位降至50%")
                     elif mean_adx < 25:
                         position_multiplier = 0.7
                         print(f"🟡 空頭regime {regime_signal}（ADX={mean_adx:.1f}）中等趨勢，空單倉位{position_multiplier * 100:.0f}%"
@@ -2361,8 +2444,8 @@ def main():
                         print(f"🟢 空頭regime {regime_signal}（ADX={mean_adx:.1f}）強趨勢，空單正常倉位"
                               f"{'[SIM]' if SIMULATION_MODE else ''}掃描...")
 
-                    _last_scout_adx = mean_adx
-                    _last_scout_score = curr_score
+                    _last_scout_adx_short = mean_adx
+                    _last_scout_score_short = curr_score
 
                     if mean_adx >= 20:
                         if len(positions) >= MAX_CONCURRENT_POSITIONS:
@@ -2376,7 +2459,9 @@ def main():
                             print(f"⛔ SL 連環觸發保護，暫停空單入場")
                             continue
 
-                        for s in target_coins:
+                        # [BUG FIX] 空單應掃描跌幅最大的幣，重新取弱勢幣列表
+                        short_target_coins = scouting_strong_coins(20, for_short=True)
+                        for s in short_target_coins:
                             try:
                                 flow, last_p, is_strong = apply_lee_ready_short_logic(s)
                                 atr, is_v = get_market_metrics(s)
