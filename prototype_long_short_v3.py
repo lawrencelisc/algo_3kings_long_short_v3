@@ -189,7 +189,10 @@ SCOUTING_INTERVAL = 125
 POSITION_CHECK_INTERVAL = 4
 
 BRAKE_ADX_HIGH_THRESHOLD = 40
-TIMEOUT_SECONDS = 2700
+TIMEOUT_SECONDS = 2700        # 首次 timeout 門檻（45 分鐘）
+TIMEOUT_EXTENSION = 5400      # 健康檢查通過後延長時間（90 分鐘）
+TIMEOUT_LOSS_FLOOR = -0.003   # 虧損超過 -0.3% → 不延長，直接出場
+TIMEOUT_EXT_ADX_MIN = 25.0    # 延長條件：ADX 最低要求
 
 # ── 三感應器參數 ──
 # Sensor A: ADX 動態門檻（當日 ADX 分布的第 N 百分位數）
@@ -1820,8 +1823,54 @@ def manage_long_positions(regime=None):
                 exit_reason = None
                 time_held = time.time() - pos.get('entry_time', time.time())
 
+                # ── 條件式 Timeout 健康檢查 ──
+                # 情況1: 虧損 > TIMEOUT_LOSS_FLOOR → 立即出場
+                # 情況2: 平手 ± 0.3%，第一次到期 → 檢查 Regime + ADX
+                #         通過 → 延長 TIMEOUT_EXTENSION 秒，等待蓄力
+                #         不通過 → 出場（上落市或 Regime 已轉向）
+                # 情況3: 延長期亦到期 → 強制出場
                 if time_held > TIMEOUT_SECONDS and pnl_pct < 0.005:
-                    exit_reason = "Momentum Timeout (Stalled Zombie)"
+                    _ext_until = pos.get('timeout_extended_until', 0)
+
+                    if pnl_pct < TIMEOUT_LOSS_FLOOR:
+                        # 情況1：虧損明顯，市場已否定方向
+                        exit_reason = "Momentum Timeout (Stalled Zombie)"
+                        print(f"⏱️ {s} Timeout: 虧損 {pnl_pct*100:.2f}% 超過門檻，出場")
+
+                    elif _ext_until > 0 and time.time() > _ext_until:
+                        # 情況3：延長期已過，仍未有動力
+                        exit_reason = "Momentum Timeout (Extended, Still Stalled)"
+                        print(f"⏱️ {s} 延長期亦到期，強制出場（持倉 {time_held/3600:.1f}h）")
+
+                    elif _ext_until == 0:
+                        # 情況2：第一次到期，做健康檢查
+                        _reg = regime or {}
+                        _curr_regime = _reg.get('regime_signal', 0)
+                        _curr_adx    = _reg.get('mean_adx', 0)
+                        _curr_ranging = _reg.get('is_ranging', False)
+
+                        _dir_ok = (
+                            (is_short and _curr_regime in (-1, -2, -3)) or
+                            (not is_short and _curr_regime in (1, 2))
+                        )
+                        _adx_ok     = _curr_adx >= TIMEOUT_EXT_ADX_MIN
+                        _market_ok  = not _curr_ranging
+
+                        if _dir_ok and _adx_ok and _market_ok:
+                            # ✅ 健康檢查通過 → 延長
+                            pos['timeout_extended_until'] = time.time() + TIMEOUT_EXTENSION
+                            _ext_mins = TIMEOUT_EXTENSION // 60
+                            print(f"🔍 {s} Timeout健康檢查✅："
+                                  f" Regime={_curr_regime} ADX={_curr_adx:.1f}"
+                                  f" → 延長 {_ext_mins} 分鐘等待蓄力")
+                        else:
+                            # ❌ 健康檢查不通過 → 出場
+                            exit_reason = "Momentum Timeout (Stalled Zombie)"
+                            _fail = []
+                            if not _dir_ok:    _fail.append(f"Regime={_curr_regime}方向已轉")
+                            if not _adx_ok:    _fail.append(f"ADX={_curr_adx:.1f}<{TIMEOUT_EXT_ADX_MIN}")
+                            if not _market_ok: _fail.append("上落市")
+                            print(f"⏱️ {s} Timeout健康檢查❌：{', '.join(_fail)}，出場")
 
                 curr_t = time.time()
                 last_check = pos.get('last_flow_check', 0)
@@ -2461,9 +2510,15 @@ def main():
                         if _r == regime_signal: _persist += 1
                         else: break
 
+                    # ── 冷啟動保護：窗口未滿 6 個讀數時，強制倉位上限 30% ──
+                    _sensor_warming = len(_adx_session_window) < 6
+                    if _sensor_warming:
+                        position_multiplier = 0.3
+                        print(f"🌡️ [感應器熱身] 讀數{len(_adx_session_window)}/6，倉位上限30%（ADX={mean_adx:.1f}）")
+
                     # ══ 三感應器組合閘門（多頭）══
                     # C → A → Score → MEI → B（由外到內，越外越嚴格）
-                    if is_ranging:
+                    if is_ranging and not _sensor_warming:
                         print(f"🔴 [C] 上落市靜音（均值={adx_sess_mean:.1f} std={adx_sess_std:.2f}），跳過多頭")
                         _last_scout_adx = mean_adx; _last_scout_score = curr_score
                         continue
@@ -2550,9 +2605,15 @@ def main():
                         if _r == regime_signal: _persist += 1
                         else: break
 
+                    # ── 冷啟動保護：窗口未滿 6 個讀數時，強制倉位上限 30% ──
+                    _sensor_warming = len(_adx_session_window) < 6
+                    if _sensor_warming:
+                        position_multiplier = 0.3
+                        print(f"🌡️ [感應器熱身] 讀數{len(_adx_session_window)}/6，空頭倉位上限30%（ADX={mean_adx:.1f}）")
+
                     # ══ 三感應器組合閘門（空頭）══
                     # 空頭注意：ADX 退坡 = 翻空良機，Sensor C/A 仍攔截，MEI 放寬
-                    if is_ranging:
+                    if is_ranging and not _sensor_warming:
                         print(f"🔴 [C] 上落市靜音（均值={adx_sess_mean:.1f} std={adx_sess_std:.2f}），跳過空頭")
                         _last_scout_adx_short = mean_adx; _last_scout_score_short = curr_score
                         continue
