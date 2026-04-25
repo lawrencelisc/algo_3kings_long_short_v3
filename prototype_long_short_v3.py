@@ -25,6 +25,39 @@ except Exception as e:
     TELEGRAM_ENABLED = False
     print(f"⚠️ Telegram Bot 初始化失敗: {e}")
 
+# 嘗試導入 InfluxDB Writer
+try:
+    import sys as _sys
+    import os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), 'utils'))
+    from influx_writer import (
+        write_regime as _influx_write_regime,
+        write_trade  as _influx_write_trade,
+        write_balance as _influx_write_balance,
+        write_position as _influx_write_position,
+        INFLUX_ENABLED,
+    )
+    if INFLUX_ENABLED:
+        print("✅ InfluxDB Writer 已成功加載")
+    else:
+        print("⚠️ InfluxDB 已停用（INFLUX_ENABLED=false 或連線失敗）")
+except ImportError:
+    INFLUX_ENABLED = False
+    print("⚠️ InfluxDB Writer 模塊未找到，監控功能將禁用")
+except Exception as e:
+    INFLUX_ENABLED = False
+    print(f"⚠️ InfluxDB Writer 初始化失敗: {e}")
+
+
+def _safe_influx(fn, *args, **kwargs):
+    """呼叫 InfluxDB 寫入函數，失敗時靜默，不影響主策略。"""
+    if not INFLUX_ENABLED:
+        return
+    try:
+        fn(*args, **kwargs)
+    except Exception:
+        pass
+
 # ==========================================
 # ⚙️ [系統/參數] 模組初始化與 API 配置 V3 Long/Short
 # ==========================================
@@ -1716,6 +1749,12 @@ def manage_long_positions(regime=None):
                 print(f"🧹 {'[SIM]' if SIMULATION_MODE else ''} 倉位已平: {s}")
                 real_pnl = process_native_exit_log(
                     s, positions[s], positions[s].get('side', 'long'))
+                _safe_influx(_influx_write_trade,
+                             symbol=s, action='NATIVE_EXIT',
+                             price=positions[s].get('entry_price', 0),
+                             amount=positions[s].get('amount', 0),
+                             realized_pnl=real_pnl,
+                             sim_mode=SIMULATION_MODE)
                 cancel_all_v5(s)
                 # Native exit（Bybit 原生 TP/SL）視為 SL 類型
                 handle_trade_result(s, real_pnl, is_sl_exit=True)
@@ -1750,6 +1789,16 @@ def manage_long_positions(regime=None):
 
                 if 'max_pnl_pct' not in pos: pos['max_pnl_pct'] = pnl_pct
                 pos['max_pnl_pct'] = max(pos['max_pnl_pct'], pnl_pct)
+
+                _safe_influx(_influx_write_position,
+                             symbol=s,
+                             side='short' if is_short else 'long',
+                             entry_price=pos['entry_price'],
+                             current_price=curr_p,
+                             pnl_pct=pnl_pct,
+                             unrealized_pnl=pnl_pct * pos['entry_price'] * pos['amount'],
+                             time_held_secs=time.time() - pos.get('entry_time', time.time()),
+                             sim_mode=SIMULATION_MODE)
 
                 # ── 保本 ──
                 if not pos['is_breakeven'] and pnl_pct > (coin_vol_pct * 2.0):
@@ -1975,6 +2024,11 @@ def manage_long_positions(regime=None):
                         'amount': pos['amount'], 'reason': exit_reason,
                         'realized_pnl': ioc_pnl
                     })
+                    _safe_influx(_influx_write_trade,
+                                 symbol=s, action=exit_action,
+                                 price=curr_p, amount=pos['amount'],
+                                 realized_pnl=ioc_pnl,
+                                 sim_mode=SIMULATION_MODE)
 
                     if TELEGRAM_ENABLED:
                         try:
@@ -2208,6 +2262,13 @@ def execute_live_long(symbol, net_flow, current_price, is_strong,
         'mean_adx': adx_tag,  # ← 新增
         'market_score': score_tag  # ← 新增
     })
+    _safe_influx(_influx_write_trade,
+                 symbol=symbol, action='LONG_ENTRY',
+                 price=actual_price, amount=actual_amount,
+                 atr=atr, net_flow=net_flow,
+                 tp_price=tp_p, sl_price=sl_p,
+                 regime_signal=regime_signal_tag, mean_adx=adx_tag,
+                 market_score=score_tag, sim_mode=SIMULATION_MODE)
     print(f"📈 {'[SIM] ' if SIMULATION_MODE else ''}[入貨做多] {symbol} "
           f"@ {actual_price:.4f} | 數量:{actual_amount}")
 
@@ -2424,6 +2485,13 @@ def execute_live_short(symbol, net_flow, current_price, is_strong,
         'mean_adx': adx_tag,
         'market_score': score_tag
     })
+    _safe_influx(_influx_write_trade,
+                 symbol=symbol, action='SHORT_ENTRY',
+                 price=actual_price, amount=actual_amount,
+                 atr=atr, net_flow=net_flow,
+                 tp_price=tp_p, sl_price=sl_p,
+                 regime_signal=regime_signal_tag, mean_adx=adx_tag,
+                 market_score=score_tag, sim_mode=SIMULATION_MODE)
     print(f"📉 {'[SIM] ' if SIMULATION_MODE else ''}[入貨做空] {symbol} "
           f"@ {actual_price:.4f} | 數量:{actual_amount}")
 
@@ -2462,6 +2530,34 @@ def main():
         try:
             regime = get_btc_regime_v3_fast()
             manage_long_positions(regime)
+
+            # ── InfluxDB: 每輪寫入 Regime 狀態 ──
+            _safe_influx(_influx_write_regime,
+                         regime_signal=regime.get('regime_signal', 0),
+                         mean_adx=regime.get('mean_adx', 0.0),
+                         market_score=regime.get('market_score', 0.0),
+                         adx_mei=regime.get('adx_mei', 0.0),
+                         is_ranging=bool(regime.get('is_ranging', False)),
+                         adx_dynamic_floor=regime.get('adx_dynamic_floor', 20.0),
+                         brake=bool(regime.get('brake', False)),
+                         soft_brake=bool(regime.get('soft_brake', False)),
+                         sim_mode=SIMULATION_MODE)
+
+            # ── InfluxDB: 每輪寫入帳戶餘額 ──
+            if SIMULATION_MODE:
+                _safe_influx(_influx_write_balance,
+                             balance=sim_balance,
+                             equity=sim_equity,
+                             total_pnl=sim_total_pnl,
+                             sim_mode=True)
+            else:
+                try:
+                    _live_bal = get_live_usdt_balance()
+                    _safe_influx(_influx_write_balance,
+                                 balance=_live_bal,
+                                 sim_mode=False)
+                except Exception:
+                    pass
 
             curr_t = time.time()
 
