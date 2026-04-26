@@ -174,22 +174,13 @@ cooldown_tracker = {}
 consecutive_losses = {}
 recent_sl_times = []  # Cascade Pause 追蹤器
 
-# ADX 和 Score 趨勢追蹤（多/空分開記憶，避免制度切換時 decay 計算污染）
-_last_scout_adx = 0.0        # 上次多頭 scout 的 ADX
-_last_scout_score = 0.0      # 上次多頭 scout 的 Score
-_last_scout_adx_short = 0.0  # 上次空頭 scout 的 ADX
-_last_scout_score_short = 0.0  # 上次空頭 scout 的 Score
-
 # ADX MEI（動能耗盡指數）追蹤：保留最近 3 次 regime 計算的 (timestamp, mean_adx)
 # MEI = 二階導數（加速度）/ |初速度|，用於探測 ADX 是否正在急速鈍化（趨近頂部）
 _adx_history: list = []  # [(unix_ts, mean_adx), ...]，最多保留 3 筆
 
-# ── 三感應器狀態（自適應市況偵測）──
-# Sensor A: 滾動 ADX 百分位，動態升降入場門檻
-# Sensor B: Regime 穩定性，防止方向急轉時倉全開
-# Sensor C: ADX Variance，識別上落市 / 正弦波格局
-_adx_session_window: deque = deque(maxlen=20)   # Sensor A + C 共用
-_regime_signal_history: deque = deque(maxlen=8) # Sensor B
+# ── Sensor B：Regime 置信度（唯一保留感應器）──
+# 記錄連續幾次同向 regime 信號，用於漸進式倉位縮放；擴至 12 筆記憶
+_regime_signal_history: deque = deque(maxlen=12)
 
 # 市場狀態記憶（用於Telegram通知）
 _last_market_signal = 0  # 上次市場信號
@@ -227,15 +218,10 @@ TIMEOUT_EXTENSION = 5400      # 健康檢查通過後延長時間（90 分鐘）
 TIMEOUT_LOSS_FLOOR = -0.003   # 虧損超過 -0.3% → 不延長，直接出場
 TIMEOUT_EXT_ADX_MIN = 25.0    # 延長條件：ADX 最低要求
 
-# ── 三感應器參數 ──
-# Sensor A: ADX 動態門檻（當日 ADX 分布的第 N 百分位數）
-SENSOR_A_PERCENTILE   = 65    # 65th percentile of rolling ADX window
-SENSOR_A_ABS_MIN      = 20.0  # 絕對最低門檻（動態值不得低於此）
-# Sensor B: Regime 穩定性（連續幾次同方向信號才允許滿倉）
-SENSOR_B_PERSIST_MIN  = 3     # 需連續 N 次同向信號，否則倉位上限 30%
-# Sensor C: 上落市偵測（ADX 低位窄幅 = 正弦波 / 週末格局）
-SENSOR_C_STD_THR      = 3.0   # ADX 標準差低於此 → 可能上落市
-SENSOR_C_MEAN_THR     = 27.0  # ADX 均值低於此 → 弱趨勢
+# ── Sensor B：漸進式倉位縮放表 ──
+# key = 連續同向 regime 信號次數，value = position_multiplier 上限
+# _persist ≥ 4 → 全倉 1.00；未列出的 _persist（即 0）→ 0.25 試探
+SENSOR_B_SCALE = {1: 0.25, 2: 0.50, 3: 0.80, 4: 1.00}
 
 ACTIVE_LONG_SIGNALS = [2]  # 測試期只用 +2 Trend Long（與 v2 相同）
 # 僅 regime -2 / -3 允許開空單；-1（MR 空頭）只 brake 多單、不開空
@@ -1290,31 +1276,6 @@ def get_btc_regime_v3_fast():
             except Exception as e:
                 logger.warning(f"⚠️ Telegram市場狀態通知失敗: {e}")
 
-        # ── Sensor A + C：滾動 ADX 窗口計算 ──
-        global _adx_session_window
-        _adx_session_window.append(mean_adx)
-        _sess = list(_adx_session_window)
-
-        # Sensor A: 動態入場門檻（當日 ADX 65th percentile）
-        adx_dynamic_floor = SENSOR_A_ABS_MIN
-        if len(_sess) >= 6:
-            adx_dynamic_floor = max(SENSOR_A_ABS_MIN,
-                                    float(np.percentile(_sess, SENSOR_A_PERCENTILE)))
-
-        # Sensor C: 上落市偵測
-        adx_session_mean = float(np.mean(_sess)) if _sess else 0.0
-        adx_session_std  = float(np.std(_sess))  if len(_sess) > 1 else 0.0
-        is_ranging = (len(_sess) >= 6 and
-                      adx_session_std < SENSOR_C_STD_THR and
-                      adx_session_mean < SENSOR_C_MEAN_THR)
-
-        if is_ranging:
-            print(f"  🔴 [Sensor-C] 上落市：ADX均值={adx_session_mean:.1f} 標準差={adx_session_std:.2f}"
-                  f"（閾值 std<{SENSOR_C_STD_THR} & mean<{SENSOR_C_MEAN_THR}）")
-        else:
-            print(f"  📏 [Sensor-A] 動態門檻={adx_dynamic_floor:.1f}"
-                  f"（ADX均值={adx_session_mean:.1f} std={adx_session_std:.2f}）")
-
         # ── ADX MEI（動能耗盡指數）計算 ──
         # MEI = (v₂ - v₁) / |v₁|
         # v₁、v₂ 為相鄰兩段的 ADX 速度（每 5min bar 標準化）
@@ -1363,10 +1324,6 @@ def get_btc_regime_v3_fast():
             'is_bear': is_bear,
             'adx_mei': adx_mei,
             'adx_velocity': adx_velocity_n,
-            'is_ranging': is_ranging,
-            'adx_dynamic_floor': adx_dynamic_floor,
-            'adx_session_mean': adx_session_mean,
-            'adx_session_std': adx_session_std,
         }
         _regime_cache['data'] = result
         _regime_cache['ts'] = time.time()
@@ -1896,16 +1853,14 @@ def manage_long_positions(regime=None):
                         _reg = regime or {}
                         _curr_regime = _reg.get('regime_signal', 0)
                         _curr_adx    = _reg.get('mean_adx', 0)
-                        _curr_ranging = _reg.get('is_ranging', False)
 
                         _dir_ok = (
                             (is_short and _curr_regime in (-1, -2, -3)) or
                             (not is_short and _curr_regime in (1, 2))
                         )
-                        _adx_ok     = _curr_adx >= TIMEOUT_EXT_ADX_MIN
-                        _market_ok  = not _curr_ranging
+                        _adx_ok = _curr_adx >= TIMEOUT_EXT_ADX_MIN
 
-                        if _dir_ok and _adx_ok and _market_ok:
+                        if _dir_ok and _adx_ok:
                             # ✅ 健康檢查通過 → 延長
                             pos['timeout_extended_until'] = time.time() + TIMEOUT_EXTENSION
                             _ext_mins = TIMEOUT_EXTENSION // 60
@@ -2537,8 +2492,6 @@ def main():
                          mean_adx=regime.get('mean_adx', 0.0),
                          market_score=regime.get('market_score', 0.0),
                          adx_mei=regime.get('adx_mei', 0.0),
-                         is_ranging=bool(regime.get('is_ranging', False)),
-                         adx_dynamic_floor=regime.get('adx_dynamic_floor', 20.0),
                          brake=bool(regime.get('brake', False)),
                          soft_brake=bool(regime.get('soft_brake', False)),
                          sim_mode=SIMULATION_MODE)
@@ -2589,189 +2542,107 @@ def main():
                     print(f"📡 Regime: {_SIGNAL_LABEL.get(regime_signal, '未知')} | "
                           f"啟用多頭:{ACTIVE_LONG_SIGNALS} 空單regime:{sorted(SHORT_ENTRY_REGIMES)}")
 
-                global _last_scout_adx, _last_scout_score
                 if is_long_signal:
-                    mean_adx        = regime.get('mean_adx', 0)
-                    curr_score      = regime.get('market_score', 0)
-                    adx_mei         = regime.get('adx_mei', 0.0)
-                    is_ranging      = regime.get('is_ranging', False)
-                    adx_dyn_floor   = regime.get('adx_dynamic_floor', SENSOR_A_ABS_MIN)
-                    adx_sess_mean   = regime.get('adx_session_mean', 0.0)
-                    adx_sess_std    = regime.get('adx_session_std', 0.0)
-                    score_decay     = _last_scout_score - curr_score if _last_scout_score > 0 else 0
+                    mean_adx = regime.get('mean_adx', 0)
+                    adx_mei  = regime.get('adx_mei', 0.0)
 
-                    # Sensor B: 計算連續同向次數
+                    # ── Sensor B：計算連續同向次數 → 漸進式倉位縮放 ──
                     _persist = 0
                     for _r in reversed(list(_regime_signal_history)):
                         if _r == regime_signal: _persist += 1
                         else: break
 
-                    # ── 冷啟動保護：窗口未滿 6 個讀數時，強制倉位上限 30% ──
-                    _sensor_warming = len(_adx_session_window) < 6
-                    if _sensor_warming:
-                        position_multiplier = 0.3
-                        print(f"🌡️ [感應器熱身] 讀數{len(_adx_session_window)}/6，倉位上限30%（ADX={mean_adx:.1f}）")
-
-                    # ══ 三感應器組合閘門（多頭）══
-                    # C → A → Score → MEI → B（由外到內，越外越嚴格）
-                    if is_ranging and not _sensor_warming:
-                        print(f"🔴 [C] 上落市靜音（均值={adx_sess_mean:.1f} std={adx_sess_std:.2f}），跳過多頭")
-                        _last_scout_adx = mean_adx; _last_scout_score = curr_score
-                        continue
-                    elif mean_adx < adx_dyn_floor:
-                        print(f"🔴 [A] 動態門檻={adx_dyn_floor:.1f} > ADX={mean_adx:.1f}，跳過多頭")
-                        _last_scout_adx = mean_adx; _last_scout_score = curr_score
-                        continue
-                    elif score_decay > 0.05 and _last_scout_score > 0:
-                        print(f"⚠️ Score衰減 {score_decay:.3f}（{_last_scout_score:.3f}→{curr_score:.3f}），跳過多頭")
-                        _last_scout_adx = mean_adx; _last_scout_score = curr_score
-                        continue
-                    elif adx_mei < -0.8:
+                    # MEI 決定基礎倉位上限（頂部保護）
+                    if adx_mei < -0.8:
                         print(f"🔴 [MEI] 頂部確認={adx_mei:.2f}，跳過多頭（ADX={mean_adx:.1f}）")
-                        _last_scout_adx = mean_adx; _last_scout_score = curr_score
                         continue
+                    elif adx_mei < -0.5:
+                        position_multiplier = 0.3
+                    elif adx_mei < -0.3:
+                        position_multiplier = 0.7
                     else:
-                        # 倉位由 MEI 決定基礎值，Sensor B 進一步上限
-                        if adx_mei < -0.5:
-                            position_multiplier = 0.3
-                        elif adx_mei < -0.3:
-                            position_multiplier = 0.7
-                        elif mean_adx < 25:
-                            position_multiplier = 0.7
-                        else:
-                            position_multiplier = 1.0
+                        position_multiplier = 1.0
 
-                        # Sensor B: 信號未穩定 → 倉位上限 30%
-                        if _persist < SENSOR_B_PERSIST_MIN:
-                            position_multiplier = min(position_multiplier, 0.3)
-                            print(f"⚠️ [B] 連續{_persist}次（需{SENSOR_B_PERSIST_MIN}），多頭倉位上限30%"
-                                  f"（ADX={mean_adx:.1f} MEI={adx_mei:+.2f}）"
-                                  f"{'[SIM]' if SIMULATION_MODE else ''}")
-                        else:
-                            _icon = "🟠" if position_multiplier <= 0.3 else "🟡" if position_multiplier <= 0.7 else "🟢"
-                            print(f"{_icon} [三感應器✅] 多頭入場 ADX={mean_adx:.1f} MEI={adx_mei:+.2f}"
-                                  f" 連續{_persist}次 倉位={position_multiplier:.0%}"
-                                  f"{'[SIM]' if SIMULATION_MODE else ''}")
+                    # Sensor B：漸進縮放，取 MEI 倉位與 B 縮放的較小值
+                    _b_scale = SENSOR_B_SCALE.get(_persist, 1.0 if _persist >= 4 else 0.25)
+                    position_multiplier = min(position_multiplier, _b_scale)
 
-                    _last_scout_adx = mean_adx
-                    _last_scout_score = curr_score
+                    _icon = "🟠" if position_multiplier <= 0.3 else "🟡" if position_multiplier <= 0.7 else "🟢"
+                    print(f"{_icon} [Sensor B] 多頭 ADX={mean_adx:.1f} MEI={adx_mei:+.2f}"
+                          f" 連續{_persist}次 倉位={position_multiplier:.0%}"
+                          f"{'[SIM]' if SIMULATION_MODE else ''}")
 
-                    # Sensor A 動態門檻已取代舊版 mean_adx >= 20 檢查
-                    if mean_adx >= adx_dyn_floor:
-                        # 倉位上限檢查
-                        if len(positions) >= MAX_CONCURRENT_POSITIONS:
-                            print(f"⛔ 倉位已達上限 {MAX_CONCURRENT_POSITIONS}，跳過本輪掃描")
+                    # 倉位上限 + Cascade SL
+                    if len(positions) >= MAX_CONCURRENT_POSITIONS:
+                        print(f"⛔ 倉位已達上限 {MAX_CONCURRENT_POSITIONS}，跳過本輪掃描")
+                        continue
+                    now = time.time()
+                    recent_sl_times[:] = [t for t in recent_sl_times
+                                          if now - t < CASCADE_SL_WINDOW]
+                    if len(recent_sl_times) >= CASCADE_SL_TRIGGER:
+                        print(f"⛔ SL 連環觸發保護：{len(recent_sl_times)} 筆 SL 在 {CASCADE_SL_WINDOW}s 內，暫停入場")
+                        continue
+
+                    for s in target_coins:
+                        try:
+                            flow, last_p, is_strong = apply_lee_ready_long_logic(s)
+                            atr, is_v = get_market_metrics(s)
+                            if last_p > 0:
+                                execute_live_long(s, flow, last_p, is_strong,
+                                                  atr, is_v, regime=regime,
+                                                  position_multiplier=position_multiplier)
+                        except Exception:
                             continue
-
-                        # Cascade Pause 檢查
-                        now = time.time()
-                        recent_sl_times[:] = [t for t in recent_sl_times
-                                              if now - t < CASCADE_SL_WINDOW]
-                        if len(recent_sl_times) >= CASCADE_SL_TRIGGER:
-                            print(f"⛔ SL 連環觸發保護：{len(recent_sl_times)} 筆 SL 在 {CASCADE_SL_WINDOW}s 內，暫停入場")
-                            continue
-
-                        for s in target_coins:
-                            try:
-                                flow, last_p, is_strong = apply_lee_ready_long_logic(s)
-                                atr, is_v = get_market_metrics(s)
-                                if last_p > 0:
-                                    execute_live_long(s, flow, last_p, is_strong,
-                                                      atr, is_v, regime=regime,
-                                                      position_multiplier=position_multiplier)
-                            except Exception:
-                                continue
-                            time.sleep(0.3)
+                        time.sleep(0.3)
                 elif can_short_entry:
-                    mean_adx        = regime.get('mean_adx', 0)
-                    curr_score      = regime.get('market_score', 0)
-                    adx_mei         = regime.get('adx_mei', 0.0)
-                    is_ranging      = regime.get('is_ranging', False)
-                    adx_dyn_floor   = regime.get('adx_dynamic_floor', SENSOR_A_ABS_MIN)
-                    adx_sess_mean   = regime.get('adx_session_mean', 0.0)
-                    adx_sess_std    = regime.get('adx_session_std', 0.0)
+                    mean_adx = regime.get('mean_adx', 0)
+                    adx_mei  = regime.get('adx_mei', 0.0)
 
-                    # [BUG FIX] 空單使用獨立 decay 追蹤
-                    global _last_scout_adx_short, _last_scout_score_short
-                    score_decay = _last_scout_score_short - curr_score if _last_scout_score_short > 0 else 0
-
-                    # Sensor B: 計算連續同向次數
+                    # ── Sensor B：計算連續同向次數 → 漸進式倉位縮放 ──
                     _persist = 0
                     for _r in reversed(list(_regime_signal_history)):
                         if _r == regime_signal: _persist += 1
                         else: break
 
-                    # ── 冷啟動保護：窗口未滿 6 個讀數時，強制倉位上限 30% ──
-                    _sensor_warming = len(_adx_session_window) < 6
-                    if _sensor_warming:
-                        position_multiplier = 0.3
-                        print(f"🌡️ [感應器熱身] 讀數{len(_adx_session_window)}/6，空頭倉位上限30%（ADX={mean_adx:.1f}）")
-
-                    # ══ 三感應器組合閘門（空頭）══
-                    # 空頭注意：ADX 退坡 = 翻空良機，Sensor C/A 仍攔截，MEI 放寬
-                    if is_ranging and not _sensor_warming:
-                        print(f"🔴 [C] 上落市靜音（均值={adx_sess_mean:.1f} std={adx_sess_std:.2f}），跳過空頭")
-                        _last_scout_adx_short = mean_adx; _last_scout_score_short = curr_score
-                        continue
-                    elif mean_adx < adx_dyn_floor:
-                        print(f"🔴 [A] 動態門檻={adx_dyn_floor:.1f} > ADX={mean_adx:.1f}，跳過空頭")
-                        _last_scout_adx_short = mean_adx; _last_scout_score_short = curr_score
-                        continue
-                    elif score_decay > 0.05 and _last_scout_score_short > 0:
-                        print(f"⚠️ Score衰減 {score_decay:.3f}（{_last_scout_score_short:.3f}→{curr_score:.3f}），跳過空頭")
-                        _last_scout_adx_short = mean_adx; _last_scout_score_short = curr_score
-                        continue
+                    # 空頭 MEI：ADX 退坡是翻空機會，僅極端值減倉（不跳過）
+                    if adx_mei < -1.5:
+                        position_multiplier = 0.5
+                    elif adx_mei < -0.8:
+                        position_multiplier = 0.7
                     else:
-                        # 空頭：MEI 負不跳過（ADX退坡 = 翻空機會），只在極端時減倉
-                        if adx_mei < -1.5:
-                            position_multiplier = 0.5
-                        elif adx_mei < -0.8:
-                            position_multiplier = 0.7
-                        elif mean_adx < 25:
-                            position_multiplier = 0.7
-                        else:
-                            position_multiplier = 1.0
+                        position_multiplier = 1.0
 
-                        # Sensor B: 信號未穩定 → 倉位上限 30%
-                        if _persist < SENSOR_B_PERSIST_MIN:
-                            position_multiplier = min(position_multiplier, 0.3)
-                            print(f"⚠️ [B] 連續{_persist}次（需{SENSOR_B_PERSIST_MIN}），空頭倉位上限30%"
-                                  f"（ADX={mean_adx:.1f} MEI={adx_mei:+.2f}）"
-                                  f"{'[SIM]' if SIMULATION_MODE else ''}")
-                        else:
-                            _icon = "🟠" if position_multiplier <= 0.3 else "🟡" if position_multiplier <= 0.7 else "🟢"
-                            print(f"{_icon} [三感應器✅] 空頭入場 ADX={mean_adx:.1f} MEI={adx_mei:+.2f}"
-                                  f" 連續{_persist}次 倉位={position_multiplier:.0%}"
-                                  f"{'[SIM]' if SIMULATION_MODE else ''}")
+                    # Sensor B：漸進縮放，取 MEI 倉位與 B 縮放的較小值
+                    _b_scale = SENSOR_B_SCALE.get(_persist, 1.0 if _persist >= 4 else 0.25)
+                    position_multiplier = min(position_multiplier, _b_scale)
 
-                    _last_scout_adx_short = mean_adx
-                    _last_scout_score_short = curr_score
+                    _icon = "🟠" if position_multiplier <= 0.3 else "🟡" if position_multiplier <= 0.7 else "🟢"
+                    print(f"{_icon} [Sensor B] 空頭 ADX={mean_adx:.1f} MEI={adx_mei:+.2f}"
+                          f" 連續{_persist}次 倉位={position_multiplier:.0%}"
+                          f"{'[SIM]' if SIMULATION_MODE else ''}")
 
-                    if mean_adx >= adx_dyn_floor:
-                        if len(positions) >= MAX_CONCURRENT_POSITIONS:
-                            print(f"⛔ 倉位已達上限 {MAX_CONCURRENT_POSITIONS}，跳過本輪空單掃描")
+                    if len(positions) >= MAX_CONCURRENT_POSITIONS:
+                        print(f"⛔ 倉位已達上限 {MAX_CONCURRENT_POSITIONS}，跳過本輪空單掃描")
+                        continue
+                    now = time.time()
+                    recent_sl_times[:] = [t for t in recent_sl_times
+                                          if now - t < CASCADE_SL_WINDOW]
+                    if len(recent_sl_times) >= CASCADE_SL_TRIGGER:
+                        print(f"⛔ SL 連環觸發保護，暫停空單入場")
+                        continue
+
+                    short_target_coins = scouting_strong_coins(20, for_short=True)
+                    for s in short_target_coins:
+                        try:
+                            flow, last_p, is_strong = apply_lee_ready_short_logic(s)
+                            atr, is_v = get_market_metrics(s)
+                            if last_p > 0:
+                                execute_live_short(s, flow, last_p, is_strong,
+                                                   atr, is_v, regime=regime,
+                                                   position_multiplier=position_multiplier)
+                        except Exception:
                             continue
-
-                        now = time.time()
-                        recent_sl_times[:] = [t for t in recent_sl_times
-                                              if now - t < CASCADE_SL_WINDOW]
-                        if len(recent_sl_times) >= CASCADE_SL_TRIGGER:
-                            print(f"⛔ SL 連環觸發保護，暫停空單入場")
-                            continue
-
-                        # [BUG FIX] 空單應掃描跌幅最大的幣，重新取弱勢幣列表
-                        short_target_coins = scouting_strong_coins(20, for_short=True)
-                        for s in short_target_coins:
-                            try:
-                                flow, last_p, is_strong = apply_lee_ready_short_logic(s)
-                                atr, is_v = get_market_metrics(s)
-                                if last_p > 0:
-                                    execute_live_short(s, flow, last_p, is_strong,
-                                                       atr, is_v, regime=regime,
-                                                       position_multiplier=position_multiplier)
-                            except Exception:
-                                continue
-                            time.sleep(0.3)
+                        time.sleep(0.3)
                 else:
                     if _current_state != _last_brake_state:
                         if regime_signal == -1:
