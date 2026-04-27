@@ -974,10 +974,10 @@ def get_btc_regime_v3_fast():
                 z_n_arr = _norm_arr(z_abs, z_lo_b, z_hi_b)
 
                 # score ∈ [0, 1]，與 MR_SCORE_THR / TR_SCORE_THR 同量綱
-                bar_scores = (W1 * (1 - adx_n_arr) +
-                              W2 * (1 - bbw_n_arr) +
-                              W3 * 0.5 +  # Hurst 固定（待後續改進）
-                              W4 * z_n_arr)
+                # 純三指標等權（移除 Hurst 佔位常數 0.5，各佔 1/3）
+                bar_scores = ((1/3) * (1 - adx_n_arr) +
+                              (1/3) * (1 - bbw_n_arr) +
+                              (1/3) * z_n_arr)
                 all_scores_list.extend(bar_scores.tolist())
 
                 all_z_scores.extend(z_vals.tolist())
@@ -1067,7 +1067,8 @@ def get_btc_regime_v3_fast():
         adx_n = _norm(mean_adx, adx_lo, adx_hi)
         bbw_n = _norm(mean_bbw, bbw_lo, bbw_hi)
         z_n = _norm(abs(mean_z), z_lo, z_hi)
-        score = W1 * (1 - adx_n) + W2 * (1 - bbw_n) + W3 * 0.5 + W4 * z_n
+        # 純三指標等權（移除 Hurst 佔位常數 0.5，各佔 1/3）
+        score = (1/3) * (1 - adx_n) + (1/3) * (1 - bbw_n) + (1/3) * z_n
 
         is_highvol = (mean_atr > atr_hi)
 
@@ -1202,28 +1203,36 @@ def get_btc_regime_v3_fast():
         eth_p = regime_data.get('ETH/USDT:USDT', {}).get('closes', [0])[-1]
         sol_p = regime_data.get('SOL/USDT:USDT', {}).get('closes', [0])[-1]
 
-        # === 合併為一張表：左欄指標名，右欄對應值 ===
+        # === 合併為一張表：左欄指標名，右欄對應值（空字串為分組分隔行）===
         labels = [
-            'BTC/ETH/SOL Price', 'Composite Score', 'Z-Score', 'ADX(20/25)',
-            'BBW', 'ATR%', 'EMA Direction',
-            'HighVol/Bear', 'bear_votes', 'bull_votes', 'Signal', 'Decision'
+            'BTC/ETH/SOL Price', '',
+            'ATR%', 'HighVol', '',
+            'Composite Score', 'Z-Score', 'ADX(20/25)', 'BBW', '',
+            'EMA Direction', '',
+            'Bear', 'bear_votes', 'bull_votes', '',
+            'Signal', 'Decision',
         ]
         values = [
-            f"{btc_p:.0f} / {eth_p:.0f} / {sol_p:.1f}",
+            f"{btc_p:.0f} / {eth_p:.0f} / {sol_p:.1f}", '',
+            f"{mean_atr:.4f} (highvol_threshold: {atr_hi:.4f})",
+            f"{'Y' if is_highvol else 'N'}", '',
             f"{score:.3f} (MR: >={mr_thr:.2f} | TR: <={tr_thr:.2f})",
             f"{mean_z:+.3f} (long: <{zl_thr:.3f} | short: >{zs_thr:.3f})",
             f"{mean_adx:.1f} (>=20 trend | >=25 strong)",
-            f"{mean_bbw:.4f} (>={bb_thr:.4f} trend)",
-            f"{mean_atr:.4f} (highvol_threshold: {atr_hi:.4f})",
-            f"{'↑' if ema_dir == 1 else '↓' if ema_dir == -1 else '→'}",
-            f"highvol: {'Y' if is_highvol else 'N'} | bear: {'ON' if is_bear else 'OFF'}",
+            f"{mean_bbw:.4f} (>={bb_thr:.4f} trend)", '',
+            f"{'↑' if ema_dir == 1 else '↓' if ema_dir == -1 else '→'}", '',
+            f"{'ON' if is_bear else 'OFF'}",
             f"{bear_votes}/{n_assets} (Pass 如果有一半資產24H跌>3%)",
-            f"{bull_votes}/{n_assets} (Pass 如果有一半資產24H升>2%)",
+            f"{bull_votes}/{n_assets} (Pass 如果有一半資產24H升>2%)", '',
             f"{signal_names.get(regime_signal, 'No Signal')}",
-            status_text
+            status_text,
         ]
-        pad = max(len(max(labels, key=len)) + 4, 18)
-        table_lines = [f"  {lbl:<{pad}}{val}" for lbl, val in zip(labels, values)]
+        non_empty_labels = [l for l in labels if l != '']
+        pad = max(len(max(non_empty_labels, key=len)) + 4, 18)
+        table_lines = [
+            '' if lbl == '' else f"  {lbl:<{pad}}{val}"
+            for lbl, val in zip(labels, values)
+        ]
         utc_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         hdr_line = (
             f"🌐 市場狀態 V6.7 BugFixed（{len(regime_data)} 個資產）[{utc_str}]"
