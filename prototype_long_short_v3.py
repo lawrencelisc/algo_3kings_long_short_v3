@@ -757,19 +757,19 @@ def get_btc_regime_v3_fast():
         EMA_WIN = 21
 
         # ── [BUG FIX 1] 固定閾值，與 score ∈ [0,1] 同量綱 ──
-        MR_SCORE_THR = 0.55  # score >= 0.55 → MR 市況
-        TR_SCORE_THR = 0.40  # score <= 0.40 → 趨勢市況
+        MR_SCORE_THR = 0.52  # score >= 0.52 → MR 市況（放鬆：0.55→0.52）
+        TR_SCORE_THR = 0.42  # score <= 0.42 → 趨勢市況（放鬆：0.40→0.42）
 
         # ── Z-Score 百分位（保留動態，量綱本身就是 z-score）──
-        Z_LONG_PCT = 20
-        Z_SHORT_PCT = 80
+        Z_LONG_PCT = 25   # 放鬆：20→25
+        Z_SHORT_PCT = 75  # 放鬆：80→75
 
         # ── EMA / BB 參數 ──
-        EMA_SLOPE_BARS = 3
-        TR_BB_PCT = 60
+        EMA_SLOPE_BARS = 2  # 放鬆：3→2（連 2 根同向即可）
+        TR_BB_PCT = 50      # 放鬆：60→50
 
         # ── 高波動參數 ──
-        HVOL_ATR_PCT = 85
+        HVOL_ATR_PCT = 90  # 放鬆：85→90（更難觸發 HighVol 封鎖）
 
         # ── [BUG FIX 2] Macro Bear：調整為 300 根資料內有效的值 ──
         #   RET_7D_BARS      = 288  →  1天 (288根 × 5min = 1440min = 24h)
@@ -1128,7 +1128,7 @@ def get_btc_regime_v3_fast():
                         up_c += 1
                     elif np.all(sl < 0):
                         dn_c += 1
-            threshold = max(1, int(n_assets * 0.6))  # 60% 多數決
+            threshold = max(1, int(n_assets * 0.5))  # 放鬆：60%→50% 多數決
             if up_c >= threshold: return 1
             if dn_c >= threshold: return -1
             return 0
@@ -1156,7 +1156,7 @@ def get_btc_regime_v3_fast():
             else:
                 _block_reason.append(
                     f"L2-MR但Z不極端: z={mean_z:+.3f} 需<={zl_thr:.3f}或>={zs_thr:.3f}")
-        elif score <= tr_thr and mean_adx >= 20 and mean_bbw >= bb_thr:
+        elif score <= tr_thr and mean_adx >= 18 and mean_bbw >= bb_thr:  # 放鬆：ADX 20→18
             if mean_ndipdi < -5 and ema_dir == +1 and pdi_rising:          # [v3-FIX] pdi_rising added
                 regime_signal = 0 if is_bear else +2
                 if is_bear:
@@ -1181,8 +1181,8 @@ def get_btc_regime_v3_fast():
             _block_reason.append(
                 f"L2-死區: score={score:.3f} 在 ({tr_thr:.2f},{mr_thr:.2f}) 死區內")
         elif score <= tr_thr:
-            if mean_adx < 20:
-                _block_reason.append(f"L3A-ADX不足: {mean_adx:.1f} < 20")
+            if mean_adx < 18:
+                _block_reason.append(f"L3A-ADX不足: {mean_adx:.1f} < 18")
             if mean_bbw < bb_thr:
                 _block_reason.append(f"L3B-BBW不足: {mean_bbw:.4f} < {bb_thr:.4f}")
 
