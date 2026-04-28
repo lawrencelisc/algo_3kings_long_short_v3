@@ -197,7 +197,7 @@ MAX_NOTIONAL_PER_TRADE = 20.0
 
 NET_FLOW_SIGMA = 1.2
 TP_ATR_MULT = 5.0
-SL_ATR_MULT = 3.0
+SL_ATR_MULT = 4.0   # 放寬呼吸位：3.0→4.0（倉位等比縮小，美元風險不變）
 
 MAX_CONSECUTIVE_LOSSES = 3
 DYNAMIC_BAN_DURATION = 86400
@@ -1479,7 +1479,7 @@ def check_flow_health(symbol):
 def apply_lee_ready_long_logic(symbol):
     try:
         trades = exchange.fetch_trades(symbol, limit=200)
-        if not trades: return 0, 0, False
+        if not trades: return 0, 0, False, 0, 0
 
         df = pd.DataFrame(trades)
         df['price_change'] = df['price'].diff()
@@ -1519,10 +1519,10 @@ def apply_lee_ready_long_logic(symbol):
             is_strong = False
             print(f"⚠️ {symbol} 假突破陷阱！取消做多！")
 
-        return short_window_flow, df['price'].iloc[-1], is_strong
+        return short_window_flow, df['price'].iloc[-1], is_strong, acceleration, imbalance
     except Exception as e:
         print(f"⚠️ LR Logic Error [{symbol}]: {e}")
-        return 0, 0, False
+        return 0, 0, False, 0, 0
 
 
 def apply_lee_ready_short_logic(symbol):
@@ -1812,6 +1812,23 @@ def manage_long_positions(regime=None):
                              unrealized_pnl=pnl_pct * pos['entry_price'] * pos['amount'],
                              time_held_secs=time.time() - pos.get('entry_time', time.time()),
                              sim_mode=SIMULATION_MODE)
+
+                # ── Regime 轉向收 SL（保護成熟倉位）──
+                # 持倉 >= 30 分鐘 + 多頭入場 + regime 已轉中性/空頭 → 把 SL 收至 curr_p - 0.8×ATR
+                # 新倉 < 30 分鐘：俾呼吸位，不收緊
+                _YOUNG_POS_AGE = 1800  # 30 分鐘
+                if (not is_short
+                        and not pos['is_breakeven']
+                        and time.time() - pos.get('entry_time', time.time()) >= _YOUNG_POS_AGE
+                        and rs0 <= 0
+                        and pos.get('entry_regime_signal', 1) > 0):
+                    _tight_sl = curr_p - (0.8 * pos['atr'])
+                    if _tight_sl > pos['sl_price']:
+                        pos['sl_price'] = _tight_sl
+                        sl_updated = True
+                        _held_min = (time.time() - pos.get('entry_time', time.time())) / 60
+                        print(f"🔶 {s} 新倉Regime轉向→收緊SL: {pos['sl_price']:.4f} "
+                              f"(Regime={rs0}, 持倉{_held_min:.1f}min)")
 
                 # ── 保本 ──
                 if not pos['is_breakeven'] and pnl_pct > (coin_vol_pct * 2.0):
@@ -2258,6 +2275,7 @@ def execute_live_long(symbol, net_flow, current_price, is_strong,
         'tp_price': tp_p, 'sl_price': sl_p,
         'is_breakeven': False, 'atr': atr, 'max_pnl_pct': 0.0,
         'entry_time': time.time(), 'side': 'long',
+        'entry_regime_signal': regime_signal_tag,  # 記錄入場時 regime，用於新倉轉向保護
     }
     cooldown_tracker[symbol] = time.time() + 480
     save_dynamic_blacklist()
@@ -2639,17 +2657,30 @@ def main():
                         print(f"⛔ SL 連環觸發保護：{len(recent_sl_times)} 筆 SL 在 {CASCADE_SL_WINDOW}s 內，暫停入場")
                         continue
 
+                    # ── Sniper 優先排序：先收集所有信號，Accel 最強的排最前 ──
+                    _prescan = []
                     for s in target_coins:
                         try:
-                            flow, last_p, is_strong = apply_lee_ready_long_logic(s)
-                            atr, is_v = get_market_metrics(s)
+                            flow, last_p, is_strong, accel, imbal = apply_lee_ready_long_logic(s)
                             if last_p > 0:
-                                execute_live_long(s, flow, last_p, is_strong,
-                                                  atr, is_v, regime=regime,
-                                                  position_multiplier=position_multiplier)
+                                _is_sniper = (flow > 0 and accel > 0 and imbal > 0.15)
+                                _prescan.append((s, flow, last_p, is_strong, accel, _is_sniper))
+                        except Exception:
+                            pass
+                        time.sleep(0.3)
+                    # Sniper 先（accel 降序），其次一般 is_strong，最後其他
+                    _prescan.sort(key=lambda x: (not x[5], -x[4]))
+                    _sniper_coins = [r[0] for r in _prescan if r[5]]
+                    if _sniper_coins:
+                        print(f"🎯 Sniper 優先入場排序: {_sniper_coins}")
+                    for s, flow, last_p, is_strong, accel, _ in _prescan:
+                        try:
+                            atr, is_v = get_market_metrics(s)
+                            execute_live_long(s, flow, last_p, is_strong,
+                                              atr, is_v, regime=regime,
+                                              position_multiplier=position_multiplier)
                         except Exception:
                             continue
-                        time.sleep(0.3)
                 elif can_short_entry:
                     mean_adx = regime.get('mean_adx', 0)
                     adx_mei  = regime.get('adx_mei', 0.0)
