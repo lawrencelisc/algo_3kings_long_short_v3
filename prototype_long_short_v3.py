@@ -264,7 +264,10 @@ CSV_COLUMNS = [
 ]
 STATUS_COLUMNS = [
     'timestamp', 'btc_price', 'target_price', 'hma20', 'hma50',
-    'adx', 'signal_code', 'decision_text'
+    'adx', 'signal_code', 'decision_text',
+    'mean_ndi', 'mean_pdi', 'ndi_slope', 'pdi_slope',   # [v3-FIX] slope fields
+    'ndi_rising', 'pdi_rising', 'ndipdi',                # [v3-FIX] direction fields
+    'score', 'ema_dir', 'is_bear',                       # [v3-FIX] regime context
 ]
 
 
@@ -1022,6 +1025,10 @@ def get_btc_regime_v3_fast():
         last_z = []
         last_atr = [];
         last_ndipdi = []
+        last_ndi = []   # [v3-FIX] for ndi_slope calculation
+        last_pdi = []   # [v3-FIX] for pdi_slope calculation
+        last_ndi_prev = []  # [v3-FIX] ndi 3 bars ago
+        last_pdi_prev = []  # [v3-FIX] pdi 3 bars ago
 
         for sym, data in regime_data.items():
             idx = len(data['closes']) - 1
@@ -1031,6 +1038,11 @@ def get_btc_regime_v3_fast():
                 last_z.append(data['zscore'][idx])
                 last_atr.append(data['atr_pct'][idx])
                 last_ndipdi.append(data['ndi'][idx] - data['pdi'][idx])
+                last_ndi.append(data['ndi'][idx])          # [v3-FIX]
+                last_pdi.append(data['pdi'][idx])          # [v3-FIX]
+                prev_idx = max(0, idx - 3)                 # [v3-FIX] 3 bars = 15 min
+                last_ndi_prev.append(data['ndi'][prev_idx])  # [v3-FIX]
+                last_pdi_prev.append(data['pdi'][prev_idx])  # [v3-FIX]
 
         if not last_adx:
             result = {'signal': 0, 'brake': False, 'soft_brake': False,
@@ -1043,7 +1055,18 @@ def get_btc_regime_v3_fast():
         mean_bbw = float(np.mean(last_bbw))
         mean_z = float(np.mean(last_z))
         mean_atr = float(np.mean(last_atr))
-        mean_ndipdi = float(np.mean(last_ndipdi))
+        mean_ndipdi   = float(np.mean(last_ndipdi))
+        mean_ndi      = float(np.mean(last_ndi))       # [v3-FIX]
+        mean_pdi      = float(np.mean(last_pdi))       # [v3-FIX]
+        mean_ndi_prev = float(np.mean(last_ndi_prev))  # [v3-FIX]
+        mean_pdi_prev = float(np.mean(last_pdi_prev))  # [v3-FIX]
+        # [v3-FIX] Slope of mean -DI and +DI over last 3 bars (15 min)
+        # Positive ndi_slope = bearish momentum still building
+        # Positive pdi_slope = bullish momentum still building
+        ndi_slope     = mean_ndi - mean_ndi_prev       # [v3-FIX]
+        pdi_slope     = mean_pdi - mean_pdi_prev       # [v3-FIX]
+        ndi_rising    = ndi_slope > 0                  # [v3-FIX]
+        pdi_rising    = pdi_slope > 0                  # [v3-FIX]
 
         # ── 計算當前 bar 的複合 score ──
         def _norm(val, lo, hi):
@@ -1134,14 +1157,14 @@ def get_btc_regime_v3_fast():
                 _block_reason.append(
                     f"L2-MR但Z不極端: z={mean_z:+.3f} 需<={zl_thr:.3f}或>={zs_thr:.3f}")
         elif score <= tr_thr and mean_adx >= 20 and mean_bbw >= bb_thr:
-            if mean_ndipdi < -5 and ema_dir == +1:
+            if mean_ndipdi < -5 and ema_dir == +1 and pdi_rising:          # [v3-FIX] pdi_rising added
                 regime_signal = 0 if is_bear else +2
                 if is_bear:
                     _block_reason.append(f"L3-Bear擋+2: bear={is_bear}")
-            elif mean_ndipdi > +5 and ema_dir == -1:
+            elif mean_ndipdi > +5 and ema_dir == -1 and ndi_rising:        # [v3-FIX] ndi_rising added
                 regime_signal = -2
             else:
-                # 逐項診斷 Trend 分支內部失敗原因
+                # Diagnose which condition failed
                 if not (mean_ndipdi < -5):
                     _block_reason.append(f"L3C-NDI-PDI不足: {mean_ndipdi:+.2f} 需<-5(多)或>+5(空)")
                 if ema_dir == 0:
@@ -1150,6 +1173,10 @@ def get_btc_regime_v3_fast():
                     _block_reason.append(f"L3D-EMA方向衝突: ndipdi={mean_ndipdi:+.2f}>+5但ema=↑")
                 elif ema_dir == -1 and mean_ndipdi < -5:
                     _block_reason.append(f"L3D-EMA方向衝突: ndipdi={mean_ndipdi:+.2f}<-5但ema=↓")
+                if not ndi_rising and mean_ndipdi > +5 and ema_dir == -1:  # [v3-FIX]
+                    _block_reason.append(f"L3E-NDI下滑: ndi_slope={ndi_slope:+.2f}<=0, momentum exhausted")
+                if not pdi_rising and mean_ndipdi < -5 and ema_dir == +1:  # [v3-FIX]
+                    _block_reason.append(f"L3E-PDI下滑: pdi_slope={pdi_slope:+.2f}<=0, momentum exhausted")
         elif score > tr_thr and score < mr_thr:
             _block_reason.append(
                 f"L2-死區: score={score:.3f} 在 ({tr_thr:.2f},{mr_thr:.2f}) 死區內")
@@ -1192,10 +1219,20 @@ def get_btc_regime_v3_fast():
         if is_bear:    status_text += " 🐻 巨集觀熊市"
 
         log_status_to_csv({
-            'btc_price': round(btc_price, 2) if btc_price else 0,
-            'adx': round(mean_adx, 2),
+            'btc_price':   round(btc_price, 2) if btc_price else 0,
+            'adx':         round(mean_adx, 2),
             'signal_code': signal,
-            'decision_text': status_text
+            'decision_text': status_text,
+            'mean_ndi':    round(mean_ndi, 3),            # [v3-FIX]
+            'mean_pdi':    round(mean_pdi, 3),            # [v3-FIX]
+            'ndi_slope':   round(ndi_slope, 3),           # [v3-FIX]
+            'pdi_slope':   round(pdi_slope, 3),           # [v3-FIX]
+            'ndi_rising':  int(ndi_rising),               # [v3-FIX] 1=rising 0=falling
+            'pdi_rising':  int(pdi_rising),               # [v3-FIX] 1=rising 0=falling
+            'ndipdi':      round(mean_ndipdi, 3),         # [v3-FIX]
+            'score':       round(score, 4),               # [v3-FIX]
+            'ema_dir':     ema_dir,                       # [v3-FIX]
+            'is_bear':     int(is_bear),                  # [v3-FIX]
         })
 
         # 顯示三個資產的現價
@@ -1204,11 +1241,16 @@ def get_btc_regime_v3_fast():
         sol_p = regime_data.get('SOL/USDT:USDT', {}).get('closes', [0])[-1]
 
         # === 合併為一張表：左欄指標名，右欄對應值（空字串為分組分隔行）===
+        _ndi_arrow  = '↑ rising' if ndi_rising else '↓ falling'
+        _pdi_arrow  = '↑ rising' if pdi_rising else '↓ falling'
+        _ndi_block  = ' [BLOCKED: momentum exhausted]' if (not ndi_rising and mean_ndipdi > 5 and ema_dir == -1) else ''
+        _pdi_block  = ' [BLOCKED: momentum exhausted]' if (not pdi_rising and mean_ndipdi < -5 and ema_dir == 1) else ''
         labels = [
             'BTC/ETH/SOL Price', '',
             'ATR%', 'HighVol', '',
             'Composite Score', 'Z-Score', 'ADX(20/25)', 'BBW', '',
             'EMA Direction', '',
+            '-DI (mean)', '-DI slope(15m)', '+DI (mean)', '+DI slope(15m)', 'NDI-PDI', '',
             'Bear', 'bear_votes', 'bull_votes', '',
             'Signal', 'Decision',
         ]
@@ -1221,6 +1263,11 @@ def get_btc_regime_v3_fast():
             f"{mean_adx:.1f} (>=20 trend | >=25 strong)",
             f"{mean_bbw:.4f} (>={bb_thr:.4f} trend)", '',
             f"{'↑' if ema_dir == 1 else '↓' if ema_dir == -1 else '→'}", '',
+            f"{mean_ndi:.2f}",
+            f"{ndi_slope:+.3f}  {_ndi_arrow}{_ndi_block}",  # [v3-FIX]
+            f"{mean_pdi:.2f}",
+            f"{pdi_slope:+.3f}  {_pdi_arrow}{_pdi_block}",  # [v3-FIX]
+            f"{mean_ndipdi:+.2f}  (short if >+5 | long if <-5)", '',
             f"{'ON' if is_bear else 'OFF'}",
             f"{bear_votes}/{n_assets} (Pass 如果有一半資產24H跌>3%)",
             f"{bull_votes}/{n_assets} (Pass 如果有一半資產24H升>2%)", '',
