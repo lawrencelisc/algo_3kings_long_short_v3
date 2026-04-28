@@ -189,11 +189,11 @@ _last_market_notification_time = 0  # 上次通知時間
 # ==========================================
 # ⚙️ [系統/參數] 策略與風控全局變數
 # ==========================================
-WORKING_CAPITAL = 150.0
-MAX_LEVERAGE = 3.0
+WORKING_CAPITAL = 400.0
+MAX_LEVERAGE = 5.0
 RISK_PER_TRADE = 0.005
 MIN_NOTIONAL = 5.0
-MAX_NOTIONAL_PER_TRADE = 20.0
+MAX_NOTIONAL_PER_TRADE = 40.0
 
 NET_FLOW_SIGMA = 1.2
 TP_ATR_MULT = 5.0
