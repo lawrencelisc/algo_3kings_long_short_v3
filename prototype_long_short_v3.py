@@ -213,8 +213,8 @@ SCOUTING_INTERVAL = 125
 POSITION_CHECK_INTERVAL = 4
 
 BRAKE_ADX_HIGH_THRESHOLD = 40
-TIMEOUT_SECONDS = 2700        # 首次 timeout 門檻（45 分鐘）
-TIMEOUT_EXTENSION = 5400      # 健康檢查通過後延長時間（90 分鐘）
+TIMEOUT_SECONDS = 5400        # 首次 timeout 門檻（90 分鐘）
+TIMEOUT_EXTENSION = 10800     # 健康檢查通過後延長時間（180 分鐘）
 TIMEOUT_LOSS_FLOOR = -0.003   # 虧損超過 -0.3% → 不延長，直接出場
 TIMEOUT_EXT_ADX_MIN = 25.0    # 延長條件：ADX 最低要求
 
