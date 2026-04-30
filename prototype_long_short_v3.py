@@ -233,10 +233,12 @@ SHORT_ENTRY_REGIMES = frozenset([-2, -3])
 REGIME_CACHE_TTL = 60
 POSITIONS_CACHE_TTL = 8
 ATR_CACHE_TTL = 60
+SYMBOL_TREND_CACHE_TTL = 60  # [v4-改動1] per-symbol trend gate cache
 
 _regime_cache = {'data': None, 'ts': 0}
 _positions_cache = {'data': None, 'ts': 0}
 _atr_cache = {}
+_symbol_trend_cache: dict = {}  # [v4-改動1]
 
 BLACKLIST = [
     'USDC/USDT:USDT', 'DAI/USDT:USDT', 'FDUSD/USDT:USDT', 'BUSD/USDT:USDT',
@@ -247,13 +249,28 @@ BLACKLIST = [
     'stETH/USDT:USDT', 'cbETH/USDT:USDT', 'WHT/USDT:USDT'
 ]
 
-WHITELIST = [
+# [v4-改動6] WHITELIST 擴 40 幣，分兩級
+#   TIER1（20 個 majors）：高流動性、原 WHITELIST，full sizing
+#   TIER2（20 個 mid-cap）：自動縮倉 60%，per-symbol gate 必須通過
+TIER1_WHITELIST = [
     'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT',
     'XRP/USDT:USDT', 'ADA/USDT:USDT', 'AVAX/USDT:USDT', 'DOGE/USDT:USDT',
     'DOT/USDT:USDT', 'MATIC/USDT:USDT', 'LINK/USDT:USDT', 'UNI/USDT:USDT',
     'PEPE/USDT:USDT', 'SHIB/USDT:USDT', 'ARB/USDT:USDT', 'OP/USDT:USDT',
     'APT/USDT:USDT', 'SUI/USDT:USDT', 'NEAR/USDT:USDT', 'ATOM/USDT:USDT'
 ]
+
+TIER2_WHITELIST = [
+    'TIA/USDT:USDT',  'INJ/USDT:USDT',  'LDO/USDT:USDT',  'AAVE/USDT:USDT',
+    'BCH/USDT:USDT',  'LTC/USDT:USDT',  'TON/USDT:USDT',  'TRX/USDT:USDT',
+    'HBAR/USDT:USDT', 'FIL/USDT:USDT',  'ICP/USDT:USDT',  'IMX/USDT:USDT',
+    'SEI/USDT:USDT',  'WIF/USDT:USDT',  'BONK/USDT:USDT', 'JUP/USDT:USDT',
+    'TAO/USDT:USDT',  'ETC/USDT:USDT',  'ENA/USDT:USDT',  'ONDO/USDT:USDT',
+]
+
+WHITELIST = TIER1_WHITELIST + TIER2_WHITELIST  # 40 幣總池
+TIER2_SET = frozenset(TIER2_WHITELIST)
+TIER2_SIZE_MULTIPLIER = 0.6  # TIER2 自動縮倉 60%
 
 CSV_COLUMNS = [
     'timestamp', 'symbol', 'action', 'price', 'amount', 'trade_value',
@@ -625,6 +642,111 @@ def get_market_metrics(symbol):
     return None, False
 
 
+# ==========================================
+# 🎯 [v4-改動1] Per-Symbol Trend Gate（Tier 2）
+# ==========================================
+def check_symbol_trend(symbol):
+    """
+    Per-symbol trend confirmation（Tier 2 gate）。
+
+    與 basket regime gate 並列：basket 看「市場健康」、本函數看「該幣自己有冇趨勢」。
+    用 5m OHLCV 計：
+      - ADX(14)：趨勢強度（須 >= 22）
+      - +DI / -DI 差距（須 |spread| >= 3，方向決定 long/short）
+      - EMA21 短期斜率（須與 DI spread 同向）
+
+    Returns:
+      dict {
+        'is_long_ok' : bool,   # +DI 主導、EMA 上升
+        'is_short_ok': bool,   # -DI 主導、EMA 下降
+        'adx'        : float,
+        'di_spread'  : float,  # +DI - (-DI)，正=多空、負=空多
+        'ema_slope'  : float,  # ema21[-1] - ema21[-3]
+        'trend_score': float,  # 0~1，用於排序/sizing
+        'reason'     : str (optional, on failure)
+      }
+    Cache：60 秒，與 ATR cache 同步。
+    """
+    cached = _symbol_trend_cache.get(symbol)
+    if cached and (time.time() - cached['ts']) < SYMBOL_TREND_CACHE_TTL:
+        return cached['data']
+
+    try:
+        market_symbol = convert_to_bybit_symbol(symbol)
+        ohlcv = exchange.fetch_ohlcv(
+            market_symbol, timeframe='5m', limit=100,
+            params={'category': 'linear'}
+        )
+        if len(ohlcv) < 50:
+            result = {'is_long_ok': False, 'is_short_ok': False,
+                      'reason': 'insufficient data'}
+            _symbol_trend_cache[symbol] = {'data': result, 'ts': time.time()}
+            return result
+
+        df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+        highs = df['h'].values.astype(float)
+        lows = df['l'].values.astype(float)
+        closes = df['c'].values.astype(float)
+
+        prev_h = np.roll(highs, 1); prev_h[0] = highs[0]
+        prev_l = np.roll(lows, 1);  prev_l[0] = lows[0]
+        prev_c = np.roll(closes, 1); prev_c[0] = closes[0]
+        tr = np.maximum(highs - lows,
+                        np.maximum(np.abs(highs - prev_c), np.abs(lows - prev_c)))
+        up = highs - prev_h
+        dn = prev_l - lows
+        pdm = np.where((up > dn) & (up > 0), up, 0.0)
+        ndm = np.where((dn > up) & (dn > 0), dn, 0.0)
+
+        win = 14
+        atr_s = pd.Series(tr).ewm(alpha=1.0 / win, adjust=False).mean().values
+        pdm_s = pd.Series(pdm).ewm(alpha=1.0 / win, adjust=False).mean().values
+        ndm_s = pd.Series(ndm).ewm(alpha=1.0 / win, adjust=False).mean().values
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pdi = np.where(atr_s > 0, 100.0 * pdm_s / atr_s, 0.0)
+            ndi = np.where(atr_s > 0, 100.0 * ndm_s / atr_s, 0.0)
+            dx = np.where((pdi + ndi) > 0,
+                          100.0 * np.abs(pdi - ndi) / (pdi + ndi), 0.0)
+        adx = pd.Series(dx).ewm(alpha=1.0 / win, adjust=False).mean().values
+
+        ema21 = pd.Series(closes).ewm(span=21, adjust=False).mean().values
+        ema_slope = float(ema21[-1] - ema21[-3])  # 10-min slope
+
+        current_adx = float(adx[-1])
+        current_pdi = float(pdi[-1])
+        current_ndi = float(ndi[-1])
+        di_spread = current_pdi - current_ndi  # +DI - (-DI)
+
+        # Tier 2 入場標準：ADX>=22、DI spread>=3、EMA 同向
+        is_long_ok = (current_adx >= 22.0
+                      and di_spread >= 3.0
+                      and ema_slope > 0)
+        is_short_ok = (current_adx >= 22.0
+                       and di_spread <= -3.0
+                       and ema_slope < 0)
+
+        adx_score = min(current_adx / 40.0, 1.0)
+        di_score = min(abs(di_spread) / 20.0, 1.0)
+        trend_score = (adx_score + di_score) / 2.0
+
+        result = {
+            'is_long_ok':  is_long_ok,
+            'is_short_ok': is_short_ok,
+            'adx':         round(current_adx, 2),
+            'di_spread':   round(di_spread, 2),
+            'ema_slope':   round(ema_slope, 6),
+            'trend_score': round(trend_score, 3),
+        }
+        _symbol_trend_cache[symbol] = {'data': result, 'ts': time.time()}
+        return result
+
+    except Exception as e:
+        logger.debug(f"check_symbol_trend({symbol}) 失敗: {str(e)[:80]}")
+        return {'is_long_ok': False, 'is_short_ok': False,
+                'reason': f'error: {str(e)[:60]}'}
+
+
 def fetch_tickers_for_positions(symbols):
     """批次取得持倉現價（Sim/Live 共用公開 API）"""
     if not symbols:
@@ -766,7 +888,8 @@ def get_btc_regime_v3_fast():
 
         # ── EMA / BB 參數 ──
         EMA_SLOPE_BARS = 2  # 放鬆：3→2（連 2 根同向即可）
-        TR_BB_PCT = 50      # 放鬆：60→50
+        # [v5 Combo A] BBW 門檻由 50th → 30th（alt 中段擴張仍可進 trend）
+        TR_BB_PCT = 30
 
         # ── 高波動參數 ──
         HVOL_ATR_PCT = 90  # 放鬆：85→90（更難觸發 HighVol 封鎖）
@@ -1038,11 +1161,11 @@ def get_btc_regime_v3_fast():
                 last_z.append(data['zscore'][idx])
                 last_atr.append(data['atr_pct'][idx])
                 last_ndipdi.append(data['ndi'][idx] - data['pdi'][idx])
-                last_ndi.append(data['ndi'][idx])          # [v3-FIX]
-                last_pdi.append(data['pdi'][idx])          # [v3-FIX]
-                prev_idx = max(0, idx - 3)                 # [v3-FIX] 3 bars = 15 min
-                last_ndi_prev.append(data['ndi'][prev_idx])  # [v3-FIX]
-                last_pdi_prev.append(data['pdi'][prev_idx])  # [v3-FIX]
+                last_ndi.append(data['ndi'][idx])
+                last_pdi.append(data['pdi'][idx])
+                prev_idx = max(0, idx - 1)                 # [v4-改動4] 1 bar = 5 min（更敏感，捕捉早期動能）
+                last_ndi_prev.append(data['ndi'][prev_idx])
+                last_pdi_prev.append(data['pdi'][prev_idx])
 
         if not last_adx:
             result = {'signal': 0, 'brake': False, 'soft_brake': False,
@@ -1060,13 +1183,13 @@ def get_btc_regime_v3_fast():
         mean_pdi      = float(np.mean(last_pdi))       # [v3-FIX]
         mean_ndi_prev = float(np.mean(last_ndi_prev))  # [v3-FIX]
         mean_pdi_prev = float(np.mean(last_pdi_prev))  # [v3-FIX]
-        # [v3-FIX] Slope of mean -DI and +DI over last 3 bars (15 min)
-        # Positive ndi_slope = bearish momentum still building
-        # Positive pdi_slope = bullish momentum still building
-        ndi_slope     = mean_ndi - mean_ndi_prev       # [v3-FIX]
-        pdi_slope     = mean_pdi - mean_pdi_prev       # [v3-FIX]
-        ndi_rising    = ndi_slope > 0                  # [v3-FIX]
-        pdi_rising    = pdi_slope > 0                  # [v3-FIX]
+        # [v3-FIX] mean -DI / +DI 斜率（1 bar = 5m，見 prev_idx）
+        # [v5 Combo B] 容忍輕微負斜率（5m noise），避免 fake exhausted
+        DI_SLOPE_EPS = -0.5
+        ndi_slope     = mean_ndi - mean_ndi_prev
+        pdi_slope     = mean_pdi - mean_pdi_prev
+        ndi_rising    = ndi_slope >= DI_SLOPE_EPS
+        pdi_rising    = pdi_slope >= DI_SLOPE_EPS
 
         # ── 計算當前 bar 的複合 score ──
         def _norm(val, lo, hi):
@@ -1110,9 +1233,12 @@ def get_btc_regime_v3_fast():
             if len(data['ret']) > 0 and data['ret'][-1] > MACRO_BULL_RTN_THR
         )
         n_assets = len(regime_data)
-        # 超過半數資產 1 天收益率 < -3% (MACRO_BEAR_RTN_THR=-0.03) → 熊市閘門開啟
-        is_bear = (bear_votes > n_assets // 2)
-        # 超過半數資產 1 天收益率 > +2% (MACRO_BULL_RTN_THR=+0.02) → 強制解除熊市
+        # [v4-改動5] is_bear 升級「真熊市」：
+        #   舊：>4/8 跌過 3% 就鎖晒（alt 跌幅誤鎖）
+        #   新：必須同時 mean_adx > 30（強趨勢配合大跌幅 = 真熊）
+        #       否則只係小回調，per-symbol Tier 2 gate 會自己擋
+        is_bear_raw = (bear_votes > n_assets // 2)
+        is_bear = is_bear_raw and mean_adx > 30
         if bull_votes > n_assets // 2:
             is_bear = False
 
@@ -1128,7 +1254,9 @@ def get_btc_regime_v3_fast():
                         up_c += 1
                     elif np.all(sl < 0):
                         dn_c += 1
-            threshold = max(1, int(n_assets * 0.5))  # 放鬆：60%→50% 多數決
+            # [v4-改動7] 由 50% → 37.5%（3/8 共識）
+            # 理據：alt 領漲時 BTC/ETH/BNB 經常落後，3/8 共識已足夠證明風險偏好上行
+            threshold = max(1, int(n_assets * 0.375))
             if up_c >= threshold: return 1
             if dn_c >= threshold: return -1
             return 0
@@ -1143,6 +1271,12 @@ def get_btc_regime_v3_fast():
         regime_signal = 0
         _block_reason = []  # 逐層封鎖原因收集
 
+        # [v4-改動2] 移除 score <= tr_thr 雙重關卡
+        #   舊：score 公式入面 1/3 已來自 ADX，再 score gate = ADX 雙重壓縮
+        #   新：純粹用 ADX + BBW 門檻，避免 ADX 自己壓抑自己
+        # [v4-改動3] mean_ndipdi 門檻由 |5| 放鬆到 |3|
+        #   理據：8 幣平均 5 點過嚴；個別幣 lag 30min 即可拖死信號
+        NDIPDI_THR = 3.0  # [v4-改動3]
         if is_highvol:
             regime_signal = 0
             _block_reason.append(f"L1-HighVol: ATR%={mean_atr:.4f} > {atr_hi:.4f}")
@@ -1156,31 +1290,31 @@ def get_btc_regime_v3_fast():
             else:
                 _block_reason.append(
                     f"L2-MR但Z不極端: z={mean_z:+.3f} 需<={zl_thr:.3f}或>={zs_thr:.3f}")
-        elif score <= tr_thr and mean_adx >= 18 and mean_bbw >= bb_thr:  # 放鬆：ADX 20→18
-            if mean_ndipdi < -5 and ema_dir == +1 and pdi_rising:          # [v3-FIX] pdi_rising added
+        elif mean_adx >= 18 and mean_bbw >= bb_thr:  # [v4-改動2] 拿走 score <= tr_thr
+            if mean_ndipdi < -NDIPDI_THR and ema_dir == +1 and pdi_rising:
                 regime_signal = 0 if is_bear else +2
                 if is_bear:
-                    _block_reason.append(f"L3-Bear擋+2: bear={is_bear}")
-            elif mean_ndipdi > +5 and ema_dir == -1 and ndi_rising:        # [v3-FIX] ndi_rising added
+                    _block_reason.append(f"L3-Bear擋+2: bear={is_bear}(真熊市,ADX>30)")
+            elif mean_ndipdi > +NDIPDI_THR and ema_dir == -1 and ndi_rising:
                 regime_signal = -2
             else:
-                # Diagnose which condition failed
-                if not (mean_ndipdi < -5):
-                    _block_reason.append(f"L3C-NDI-PDI不足: {mean_ndipdi:+.2f} 需<-5(多)或>+5(空)")
+                if not (abs(mean_ndipdi) > NDIPDI_THR):
+                    _block_reason.append(
+                        f"L3C-NDI-PDI不足: {mean_ndipdi:+.2f} 需 |x|>{NDIPDI_THR}")
                 if ema_dir == 0:
-                    _block_reason.append(f"L3D-EMA無共識: ema_dir=0 (需5/8資產連3根同向)")
-                elif ema_dir == +1 and mean_ndipdi > +5:
-                    _block_reason.append(f"L3D-EMA方向衝突: ndipdi={mean_ndipdi:+.2f}>+5但ema=↑")
-                elif ema_dir == -1 and mean_ndipdi < -5:
-                    _block_reason.append(f"L3D-EMA方向衝突: ndipdi={mean_ndipdi:+.2f}<-5但ema=↓")
-                if not ndi_rising and mean_ndipdi > +5 and ema_dir == -1:  # [v3-FIX]
-                    _block_reason.append(f"L3E-NDI下滑: ndi_slope={ndi_slope:+.2f}<=0, momentum exhausted")
-                if not pdi_rising and mean_ndipdi < -5 and ema_dir == +1:  # [v3-FIX]
-                    _block_reason.append(f"L3E-PDI下滑: pdi_slope={pdi_slope:+.2f}<=0, momentum exhausted")
-        elif score > tr_thr and score < mr_thr:
-            _block_reason.append(
-                f"L2-死區: score={score:.3f} 在 ({tr_thr:.2f},{mr_thr:.2f}) 死區內")
-        elif score <= tr_thr:
+                    _block_reason.append(f"L3D-EMA無共識: ema_dir=0 (需3/8資產連2根同向)")
+                elif ema_dir == +1 and mean_ndipdi > +NDIPDI_THR:
+                    _block_reason.append(f"L3D-EMA衝突: ndipdi={mean_ndipdi:+.2f}>+{NDIPDI_THR}但ema↑")
+                elif ema_dir == -1 and mean_ndipdi < -NDIPDI_THR:
+                    _block_reason.append(f"L3D-EMA衝突: ndipdi={mean_ndipdi:+.2f}<-{NDIPDI_THR}但ema↓")
+                if not ndi_rising and mean_ndipdi > +NDIPDI_THR and ema_dir == -1:
+                    _block_reason.append(
+                        f"L3E-NDI弱: ndi_slope={ndi_slope:+.2f} < {DI_SLOPE_EPS}")
+                if not pdi_rising and mean_ndipdi < -NDIPDI_THR and ema_dir == +1:
+                    _block_reason.append(
+                        f"L3E-PDI弱: pdi_slope={pdi_slope:+.2f} < {DI_SLOPE_EPS}")
+        else:
+            # 既非 MR、又無趨勢強度：診斷
             if mean_adx < 18:
                 _block_reason.append(f"L3A-ADX不足: {mean_adx:.1f} < 18")
             if mean_bbw < bb_thr:
@@ -1243,14 +1377,18 @@ def get_btc_regime_v3_fast():
         # === 合併為一張表：左欄指標名，右欄對應值（空字串為分組分隔行）===
         _ndi_arrow  = '↑ rising' if ndi_rising else '↓ falling'
         _pdi_arrow  = '↑ rising' if pdi_rising else '↓ falling'
-        _ndi_block  = ' [BLOCKED: momentum exhausted]' if (not ndi_rising and mean_ndipdi > 5 and ema_dir == -1) else ''
-        _pdi_block  = ' [BLOCKED: momentum exhausted]' if (not pdi_rising and mean_ndipdi < -5 and ema_dir == 1) else ''
+        _ndi_block  = (
+            ' [BLOCKED: momentum exhausted]' if (
+                not ndi_rising and mean_ndipdi > NDIPDI_THR and ema_dir == -1) else '')
+        _pdi_block  = (
+            ' [BLOCKED: momentum exhausted]' if (
+                not pdi_rising and mean_ndipdi < -NDIPDI_THR and ema_dir == 1) else '')
         labels = [
             'BTC/ETH/SOL Price', '',
             'ATR%', 'HighVol', '',
             'Composite Score', 'Z-Score', 'ADX(20/25)', 'BBW', '',
             'EMA Direction', '',
-            '-DI (mean)', '-DI slope(15m)', '+DI (mean)', '+DI slope(15m)', 'NDI-PDI', '',
+            '-DI (mean)', '-DI slope(5m)', '+DI (mean)', '+DI slope(5m)', 'NDI-PDI', '',
             'Bear', 'bear_votes', 'bull_votes', '',
             'Signal', 'Decision',
         ]
@@ -2114,6 +2252,23 @@ def execute_live_long(symbol, net_flow, current_price, is_strong,
     if atr is None or atr == 0 or current_price == 0: return
     if not (is_strong and is_volatile and symbol not in positions): return
 
+    # ── [v4-改動1] Tier 2 per-symbol 趨勢確認 ──
+    # 即使 basket regime 通過，個別幣本身必須有趨勢方向，否則拒絕
+    _trend = check_symbol_trend(symbol)
+    if not _trend.get('is_long_ok'):
+        logger.debug(
+            f"⛔ [Tier2] {symbol} 多頭未確認: ADX={_trend.get('adx')} "
+            f"DI={_trend.get('di_spread')} EMA={_trend.get('ema_slope')}"
+        )
+        return
+    print(f"✅ [Tier2] {symbol} 多頭確認: ADX={_trend['adx']:.1f} "
+          f"DI+={_trend['di_spread']:+.1f} score={_trend['trend_score']:.2f}")
+
+    # [v4-改動6] TIER2 自動縮倉
+    if symbol in TIER2_SET:
+        position_multiplier *= TIER2_SIZE_MULTIPLIER
+        print(f"🔸 {symbol} TIER2 縮倉: position_multiplier={position_multiplier:.2f}")
+
     # ── [DUPCHECK] 交易所實時倉位二次確認（防止 restart 後重複開倉）──
     # 本地 positions dict 可能因重啟而與交易所不同步，需雙重確認
     if not SIMULATION_MODE:
@@ -2339,6 +2494,22 @@ def execute_live_short(symbol, net_flow, current_price, is_strong,
         return
     if not (is_strong and is_volatile and symbol not in positions):
         return
+
+    # ── [v4-改動1] Tier 2 per-symbol 趨勢確認（空單方向）──
+    _trend = check_symbol_trend(symbol)
+    if not _trend.get('is_short_ok'):
+        logger.debug(
+            f"⛔ [Tier2] {symbol} 空頭未確認: ADX={_trend.get('adx')} "
+            f"DI={_trend.get('di_spread')} EMA={_trend.get('ema_slope')}"
+        )
+        return
+    print(f"✅ [Tier2] {symbol} 空頭確認: ADX={_trend['adx']:.1f} "
+          f"DI={_trend['di_spread']:+.1f} score={_trend['trend_score']:.2f}")
+
+    # [v4-改動6] TIER2 自動縮倉
+    if symbol in TIER2_SET:
+        position_multiplier *= TIER2_SIZE_MULTIPLIER
+        print(f"🔸 {symbol} TIER2 縮倉: position_multiplier={position_multiplier:.2f}")
 
     if not SIMULATION_MODE:
         try:
@@ -2595,7 +2766,8 @@ def main():
 
             if curr_t - last_scout_time > SCOUTING_INTERVAL:
 
-                target_coins = scouting_strong_coins(20, for_short=False)  # 多單：漲幅最大
+                # [v4-改動6] 從 40 幣池揀 top 30 漲幅，per-symbol gate 再過濾
+                target_coins = scouting_strong_coins(30, for_short=False)
                 last_scout_time = curr_t
 
                 _current_state = ('HARD' if regime.get('brake') else
@@ -2718,7 +2890,8 @@ def main():
                         print(f"⛔ SL 連環觸發保護，暫停空單入場")
                         continue
 
-                    short_target_coins = scouting_strong_coins(20, for_short=True)
+                    # [v4-改動6] 從 40 幣池揀 top 30 跌幅，per-symbol gate 再過濾
+                    short_target_coins = scouting_strong_coins(30, for_short=True)
                     for s in short_target_coins:
                         try:
                             flow, last_p, is_strong = apply_lee_ready_short_logic(s)

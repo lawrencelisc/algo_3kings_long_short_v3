@@ -64,6 +64,11 @@ PARAM_SETS = {
         HVOL_ATR_PCT  = 85,
         ADX_THR       = 20,
         EMA_CONSENSUS = 0.60,   # 60% = 5/8
+        NDIPDI_THR    = 5.0,
+        SLOPE_LOOKBACK= 3,      # 15 min
+        BEAR_NEEDS_ADX= False,
+        DROP_TR_SCORE = False,  # OLD 仍保留 score <= tr_thr 關卡
+        DI_SLOPE_EPS  = 0.0,    # >0 表 ndi_slope > 0
     ),
     'NEW': dict(
         MR_SCORE_THR  = 0.52,
@@ -75,6 +80,28 @@ PARAM_SETS = {
         HVOL_ATR_PCT  = 90,
         ADX_THR       = 18,
         EMA_CONSENSUS = 0.50,   # 50% = 4/8
+        NDIPDI_THR    = 5.0,
+        SLOPE_LOOKBACK= 3,
+        BEAR_NEEDS_ADX= False,
+        DROP_TR_SCORE = False,
+        DI_SLOPE_EPS  = 0.0,
+    ),
+    # [v4] 對應 prototype 七個改動 + [v5] Combo A+B（與 live 對齊）
+    'V4': dict(
+        MR_SCORE_THR  = 0.52,
+        TR_SCORE_THR  = 0.42,   # （V4 不再使用，留作參考）
+        Z_LONG_PCT    = 25,
+        Z_SHORT_PCT   = 75,
+        EMA_SLOPE_BARS= 2,
+        TR_BB_PCT     = 30,     # [v5 Combo A] 50→30
+        HVOL_ATR_PCT  = 90,
+        ADX_THR       = 18,
+        EMA_CONSENSUS = 0.375,  # 改動7
+        NDIPDI_THR    = 3.0,    # 改動3
+        SLOPE_LOOKBACK= 1,      # 改動4：3 → 1 bar
+        BEAR_NEEDS_ADX= True,   # 改動5：is_bear 須配 mean_adx > 30
+        DROP_TR_SCORE = True,   # 改動2：移除 score <= tr_thr 雙重關卡
+        DI_SLOPE_EPS  = -0.5,   # [v5 Combo B] 容忍 1-bar DI 輕微負斜率
     ),
 }
 
@@ -246,6 +273,11 @@ def simulate_regime(aligned, params, slope_bars=None):
     if slope_bars is None:
         slope_bars = params['EMA_SLOPE_BARS']
 
+    di_slope_lookback = params.get('SLOPE_LOOKBACK', 3)  # [v4] 改動4
+    ndipdi_thr        = params.get('NDIPDI_THR', 5.0)    # [v4] 改動3
+    bear_needs_adx    = params.get('BEAR_NEEDS_ADX', False)  # [v4] 改動5
+    drop_tr_score     = params.get('DROP_TR_SCORE', False)   # [v4] 改動2
+
     btc   = aligned['BTC']
     n     = len(btc)
     times = btc['time'].values
@@ -258,6 +290,7 @@ def simulate_regime(aligned, params, slope_bars=None):
         adx_list=[]; pdi_list=[]; ndi_list=[]; ndipdi_list=[]
         bbw_list=[]; z_list=[]; atr_list=[]
         ndi_prev_list=[]; pdi_prev_list=[]
+        ret_list = []
         ema_slopes = []
         n_assets = 0
 
@@ -272,9 +305,16 @@ def simulate_regime(aligned, params, slope_bars=None):
             bbw_list.append(row['bbw'])
             z_list.append(row['zscore'] if not pd.isna(row['zscore']) else 0)
             atr_list.append(row['atr_p'] if not pd.isna(row['atr_p']) else 0)
-            prev_i = max(0, i - 3)
+            # [v4] 改動4：DI slope 用 SLOPE_LOOKBACK bars
+            prev_i = max(0, i - di_slope_lookback)
             ndi_prev_list.append(df.iloc[prev_i]['ndi'])
             pdi_prev_list.append(df.iloc[prev_i]['pdi'])
+            # 24h return（288 bars × 5min）
+            ret_i = max(0, i - 288)
+            close_now  = df.iloc[i]['close']
+            close_prev = df.iloc[ret_i]['close']
+            if close_prev and close_prev > 0:
+                ret_list.append((close_now - close_prev) / close_prev)
             n_assets += 1
 
             # EMA slope (slope_bars)
@@ -296,8 +336,13 @@ def simulate_regime(aligned, params, slope_bars=None):
         mean_ndipdi = float(np.mean(ndipdi_list))
         ndi_slope   = mean_ndi - float(np.mean(ndi_prev_list))
         pdi_slope   = mean_pdi - float(np.mean(pdi_prev_list))
-        ndi_rising  = ndi_slope > 0
-        pdi_rising  = pdi_slope > 0
+        di_slope_eps = params.get('DI_SLOPE_EPS', 0.0)
+        if di_slope_eps < 0:
+            ndi_rising = ndi_slope >= di_slope_eps
+            pdi_rising = pdi_slope >= di_slope_eps
+        else:
+            ndi_rising = ndi_slope > di_slope_eps  # 0 → strict > 0
+            pdi_rising = pdi_slope > di_slope_eps
 
         # Thresholds from rolling percentile
         mr_thr  = params['MR_SCORE_THR']
@@ -333,22 +378,39 @@ def simulate_regime(aligned, params, slope_bars=None):
         else:
             ema_dir = 0
 
-        # Regime signal (mirrors Bot logic + v3-FIX ndi_rising)
+        # [v4] is_bear 計算（改動5）
+        bear_votes = sum(1 for r in ret_list if r < -0.03)
+        bull_votes = sum(1 for r in ret_list if r > +0.02)
+        is_bear_raw = bear_votes > n_assets // 2
+        if bear_needs_adx:
+            is_bear = is_bear_raw and mean_adx > 30
+        else:
+            is_bear = is_bear_raw
+        if bull_votes > n_assets // 2:
+            is_bear = False
+
+        # Regime signal
         regime = 0
         if is_highvol:
             regime = 0
         elif score >= mr_thr:
             # MR zone
             if mean_z < zl_thr:
-                regime = +1
+                regime = 0 if is_bear else +1
             elif mean_z > zs_thr:
                 regime = -1
-        elif score <= tr_thr and mean_adx >= adx_thr and mean_bbw >= bb_thr:
-            # Trend zone
-            if mean_ndipdi < -5 and ema_dir == +1 and pdi_rising:
-                regime = +2
-            elif mean_ndipdi > +5 and ema_dir == -1 and ndi_rising:
-                regime = -2
+        else:
+            # [v4] 改動2：DROP_TR_SCORE=True 移除 score <= tr_thr 關卡
+            if drop_tr_score:
+                trend_ok = mean_adx >= adx_thr and mean_bbw >= bb_thr
+            else:
+                trend_ok = score <= tr_thr and mean_adx >= adx_thr and mean_bbw >= bb_thr
+            if trend_ok:
+                # [v4] 改動3：NDIPDI_THR 由 5 → 3
+                if mean_ndipdi < -ndipdi_thr and ema_dir == +1 and pdi_rising:
+                    regime = 0 if is_bear else +2
+                elif mean_ndipdi > +ndipdi_thr and ema_dir == -1 and ndi_rising:
+                    regime = -2
 
         results.append({
             'time':       times[i],
@@ -497,7 +559,8 @@ def plot_comparison(old_df, new_df, start_dt, end_dt):
 # -----------------------------------------
 # Export comparison CSV
 # -----------------------------------------
-def export_csv(old_df, new_df, old_entries, new_entries, start_dt, end_dt):
+def export_csv(old_df, new_df, v4_df, old_entries, new_entries, v4_entries,
+               start_dt, end_dt):
     REGIME_NAMES = {
         -2: 'SHORT_TR', -1: 'SHORT_MR', 0: 'No_signal', 1: 'LONG_MR', 2: 'LONG_TR'
     }
@@ -507,26 +570,30 @@ def export_csv(old_df, new_df, old_entries, new_entries, start_dt, end_dt):
         name = REGIME_NAMES[code]
         old_cnt = (old_df['regime'] == code).sum()
         new_cnt = (new_df['regime'] == code).sum()
+        v4_cnt  = (v4_df['regime']  == code).sum()
         rows.append({
             'regime':     name,
-            'old_bars':   int(old_cnt),
-            'old_pct':    round(old_cnt / total * 100, 1),
-            'new_bars':   int(new_cnt),
-            'new_pct':    round(new_cnt / total * 100, 1),
-            'delta_bars': int(new_cnt - old_cnt),
-            'delta_pct':  round((new_cnt - old_cnt) / total * 100, 1),
+            'old_bars':   int(old_cnt), 'old_pct': round(old_cnt / total * 100, 2),
+            'new_bars':   int(new_cnt), 'new_pct': round(new_cnt / total * 100, 2),
+            'v4_bars':    int(v4_cnt),  'v4_pct':  round(v4_cnt  / total * 100, 2),
+            'v4_vs_new':  int(v4_cnt - new_cnt),
+            'v4_x_new':   round(v4_cnt / max(new_cnt, 1), 2),
         })
     rows.append({
         'regime':     'LONG_triggers',
         'old_bars':   old_entries[0], 'old_pct': '',
         'new_bars':   new_entries[0], 'new_pct': '',
-        'delta_bars': new_entries[0] - old_entries[0], 'delta_pct': '',
+        'v4_bars':    v4_entries[0],  'v4_pct':  '',
+        'v4_vs_new':  v4_entries[0] - new_entries[0],
+        'v4_x_new':   round(v4_entries[0] / max(new_entries[0], 1), 2),
     })
     rows.append({
         'regime':     'SHORT_triggers',
         'old_bars':   old_entries[1], 'old_pct': '',
         'new_bars':   new_entries[1], 'new_pct': '',
-        'delta_bars': new_entries[1] - old_entries[1], 'delta_pct': '',
+        'v4_bars':    v4_entries[1],  'v4_pct':  '',
+        'v4_vs_new':  v4_entries[1] - new_entries[1],
+        'v4_x_new':   round(v4_entries[1] / max(new_entries[1], 1), 2),
     })
     out_df = pd.DataFrame(rows)
     out = str(OUTPUT_DIR / f'param_comparison_{start_dt.date()}_{end_dt.date()}.csv')
@@ -589,26 +656,33 @@ if __name__ == '__main__':
     new_df = simulate_regime(aligned, PARAM_SETS['NEW'])
     new_summary, new_long, new_short = summarise(new_df, "NEW parameters")
 
-    print(f"\nRendering charts...")
+    print(f"\nRunning V4 parameter simulation (改動 2/3/4/5/7)...")
+    v4_df = simulate_regime(aligned, PARAM_SETS['V4'])
+    v4_summary, v4_long, v4_short = summarise(v4_df, "V4 parameters")
+
+    print(f"\nRendering charts (OLD vs NEW)...")
     plot_comparison(old_df, new_df, start_dt, end_dt)
 
-    print(f"\nExporting comparison CSV...")
-    export_csv(old_df, new_df,
+    print(f"\nExporting 3-way comparison CSV...")
+    export_csv(old_df, new_df, v4_df,
                (old_long, old_short),
                (new_long, new_short),
+               (v4_long, v4_short),
                start_dt, end_dt)
 
     total = len(old_df)
     print(f"\n{'='*65}")
-    print(f"  Summary: impact of new parameters")
+    print(f"  Final Comparison: OLD → NEW → V4")
     print(f"{'='*65}")
     for code, name in [(-2,'SHORT TR'),(2,'LONG TR'),(-1,'SHORT MR'),(1,'LONG MR')]:
         old_c = (old_df['regime'] == code).sum()
         new_c = (new_df['regime'] == code).sum()
-        delta = new_c - old_c
-        sign  = '+' if delta >= 0 else ''
-        print(f"  {name:10s}  OLD={old_c/total*100:.1f}%  NEW={new_c/total*100:.1f}%  "
-              f"delta={sign}{delta/total*100:.1f}%")
-    print(f"  Long triggers   OLD={old_long}  NEW={new_long}  delta={new_long-old_long:+d}")
-    print(f"  Short triggers  OLD={old_short}  NEW={new_short}  delta={new_short-old_short:+d}")
+        v4_c  = (v4_df['regime']  == code).sum()
+        print(f"  {name:10s}  OLD={old_c/total*100:5.2f}%  NEW={new_c/total*100:5.2f}%  "
+              f"V4={v4_c/total*100:5.2f}%  (V4 vs NEW: {v4_c - new_c:+d} bars, "
+              f"x{v4_c / max(new_c, 1):.1f})")
+    print(f"\n  Long  triggers  OLD={old_long}  NEW={new_long}  V4={v4_long}  "
+          f"(V4 vs NEW: {v4_long - new_long:+d}, x{v4_long / max(new_long, 1):.1f})")
+    print(f"  Short triggers  OLD={old_short}  NEW={new_short}  V4={v4_short}  "
+          f"(V4 vs NEW: {v4_short - new_short:+d}, x{v4_short / max(new_short, 1):.1f})")
     print(f"\nDone. Check output/ folder.")
